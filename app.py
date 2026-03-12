@@ -4,7 +4,7 @@ Built with OpenAI, Pinecone, and Advanced Document Processing
 """
 
 import streamlit as st
-import openai
+from openai  import OpenAI
 from pinecone import Pinecone, ServerlessSpec
 from PIL import Image
 import base64
@@ -119,11 +119,11 @@ config = load_config()
 if not config:
     st.stop()
 
-openai.api_key = config["openai_api_key"]
 
 # Initialize Pinecone
 @st.cache_resource
 def init_pinecone():
+    client = OpenAI(api_key=config["openai_api_key"])
     try:
         pc = Pinecone(api_key=config["pinecone_api_key"])
         if config["pinecone_index_name"] not in [index.name for index in pc.list_indexes()]:
@@ -399,4 +399,27 @@ if prompt := st.chat_input("Message AI Assistant..."):
             })
         else:
             # Add document content as
-                        pass
+file_context += f"\n{file_data['name']}: {file_data['content'][:500]}"
+    
+    if file_context:
+        user_message_content.append({"type": "text", "text": f"\n\nFiles: {file_context}"})
+    
+    current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
+    
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    with st.chat_message("assistant"):
+        try:
+            response = client.chat.completions.create(model=selected_model, messages=current_chat["messages"], temperature=temperature, stream=True)
+            full_response = ""
+            placeholder = st.empty()
+            for chunk in response:
+                if chunk.choices[0].delta.get("content"):
+                    full_response += chunk.choices[0].delta.content
+                    placeholder.markdown(full_response + "▌")
+            placeholder.markdown(full_response)
+            current_chat["messages"].append({"role": "assistant", "content": full_response})
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+    st.rerun()
