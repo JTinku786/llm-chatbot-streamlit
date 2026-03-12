@@ -414,8 +414,7 @@ if prompt := st.chat_input("Message AI Assistant..."):
             full_response = ""
             placeholder = st.empty()
             for chunk in response:
-                if chunk.choices[0].delta.get("content"):
-                    full_response += chunk.choices[0].delta.content
+                    if chunk.choices[0].delta.content:                    full_response += chunk.choices[0].delta.content
                     placeholder.markdown(full_response + "▌")
             placeholder.markdown(full_response)
             current_chat["messages"].append({"role": "assistant", "content": full_response})
