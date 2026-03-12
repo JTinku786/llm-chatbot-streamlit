@@ -17,18 +17,34 @@ st.set_page_config(
 st.title("🤖 LLM Chatbot with OpenAI & Pinecone")
 st.markdown("Chat with AI using text and images, powered by OpenAI and Pinecone vector database")
 
-# Sidebar for API keys and configuration
+# Sidebar for configuration (hidden when using secrets)
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # OpenAI API Key
-    openai_api_key = st.text_input("OpenAI API Key", type="password", key="openai_key")
-    
-    # Pinecone configuration
-    st.subheader("Pinecone Settings")
-    pinecone_api_key = st.text_input("Pinecone API Key", type="password", key="pinecone_key")
-    pinecone_env = st.text_input("Pinecone Environment", value="gcp-starter", key="pinecone_env")
-    pinecone_index_name = st.text_input("Index Name", value="chatbot-memory", key="index_name")
+    # Try to get API keys from secrets first, fallback to user input
+    try:
+        openai_api_key = st.secrets["OPENAI_API_KEY"]
+        pinecone_api_key = st.secrets["PINECONE_API_KEY"]
+        pinecone_env = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")
+        pinecone_index_name = st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory")
+        
+        # Show that keys are loaded from secrets
+        st.success("✅ API keys loaded from secure secrets")
+        st.info(f"🔧 Environment: {pinecone_env}")
+        st.info(f"📊 Index: {pinecone_index_name}")
+        
+    except:
+        # Fallback to manual input if secrets not found
+        st.warning("⚠️ Please configure API keys below or add them to Streamlit secrets")
+        
+        # OpenAI API Key
+        openai_api_key = st.text_input("OpenAI API Key", type="password", key="openai_key")
+        
+        # Pinecone configuration
+        st.subheader("Pinecone Settings")
+        pinecone_api_key = st.text_input("Pinecone API Key", type="password", key="pinecone_key")
+        pinecone_env = st.text_input("Pinecone Environment", value="gcp-starter", key="pinecone_env")
+        pinecone_index_name = st.text_input("Index Name", value="chatbot-memory", key="index_name")
     
     # Model selection
     model_choice = st.selectbox(
@@ -41,6 +57,7 @@ with st.sidebar:
     if st.button("🗑️ Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
+
 
 # Initialize Pinecone
 def init_pinecone():
