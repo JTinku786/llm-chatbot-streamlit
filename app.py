@@ -1,261 +1,239 @@
+"""
+Modern ChatGPT/Perplexity-style LLM Application
+Built with LangChain, OpenAI, and Pinecone
+"""
+
 import streamlit as st
-import openai
-from pinecone import Pinecone, ServerlessSpec
+from src.utils.config import Config
+from src.llm.chat_engine import ChatEngine
+from src.rag.vector_store import VectorStoreManager
+from PIL import Image
 import base64
 from io import BytesIO
-from PIL import Image
-import os
+from datetime import datetime
 
 # Page configuration
 st.set_page_config(
-    page_title="LLM Chatbot with Vision",
+    page_title="AI Chat Assistant",
     page_icon="🤖",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-# Title
-st.title("🤖 LLM Chatbot with OpenAI & Pinecone")
-st.markdown("Chat with AI using text and images, powered by OpenAI and Pinecone vector database")
-
-# Sidebar for configuration (hidden when using secrets)
-with st.sidebar:
-    st.header("⚙️ Configuration")
+# Custom CSS for ChatGPT/Perplexity-style UI
+st.markdown("""
+<style>
+    /* Hide Streamlit branding */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
     
-    # Try to get API keys from secrets first, fallback to user input
-    try:
-        openai_api_key = st.secrets["OPENAI_API_KEY"]
-        pinecone_api_key = st.secrets["PINECONE_API_KEY"]
-        pinecone_env = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")
-        pinecone_index_name = st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory")
-        
-        # Show that keys are loaded from secrets
-        st.success("✅ API keys loaded from secure secrets")
-        st.info(f"🔧 Environment: {pinecone_env}")
-        st.info(f"📊 Index: {pinecone_index_name}")
-        
-    except:
-        # Fallback to manual input if secrets not found
-        st.warning("⚠️ Please configure API keys below or add them to Streamlit secrets")
-        
-        # OpenAI API Key
-        openai_api_key = st.text_input("OpenAI API Key", type="password", key="openai_key")
-        
-        # Pinecone configuration
-        st.subheader("Pinecone Settings")
-        pinecone_api_key = st.text_input("Pinecone API Key", type="password", key="pinecone_key")
-        pinecone_env = st.text_input("Pinecone Environment", value="gcp-starter", key="pinecone_env")
-        pinecone_index_name = st.text_input("Index Name", value="chatbot-memory", key="index_name")
+    /* Main container */
+    .main {
+        background-color: #f7f7f8;
+    }
+    
+    /* Chat container */
+    .stChatMessage {
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-radius: 0.5rem;
+    }
+    
+    /* User message */
+    [data-testid="stChatMessageContent"][data-baseweb="chat-message-user"] {
+        background-color: #f7f7f8;
+    }
+    
+    /* Assistant message */
+    [data-testid="stChatMessageContent"][data-baseweb="chat-message-assistant"] {
+        background-color: white;
+        border: 1px solid #ececec;
+    }
+    
+    /* Input box */
+    .stChatInputContainer {
+        border-top: 1px solid #ececec;
+        padding: 1rem 0;
+    }
+    
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        background-color: #202123;
+    }
+    
+    [data-testid="stSidebar"] .stMarkdown {
+        color: white;
+    }
+    
+    /* Title styling */
+    h1 {
+        font-weight: 600;
+        font-size: 2rem;
+        color: #202123;
+        text-align: center;
+        padding: 2rem 0 1rem 0;
+    }
+    
+    /* Remove padding */
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 0rem;
+        max-width: 48rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize configuration
+@st.cache_resource
+def initialize_services():
+    """Initialize all services (cached)."""
+    secrets = Config.get_secrets()
+    model_config = Config.get_model_config()
+    
+    # Initialize chat engine
+    chat_engine = ChatEngine(
+        api_key=secrets["openai_api_key"],
+        model=model_config["default_model"],
+        temperature=model_config["temperature"]
+    )
+    
+    # Initialize vector store
+    vector_store = VectorStoreManager(
+        api_key=secrets["pinecone_api_key"],
+        environment=secrets["pinecone_environment"],
+        index_name=secrets["pinecone_index_name"],
+        openai_api_key=secrets["openai_api_key"]
+    )
+    
+    return chat_engine, vector_store, secrets
+
+# Initialize services
+try:
+    chat_engine, vector_store, secrets = initialize_services()
+    services_ready = True
+except Exception as e:
+    st.error(f"⚠️ Error initializing services: {str(e)}")
+    st.stop()
+
+# Session state initialization
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Sidebar
+with st.sidebar:
+    st.title("🤖 AI Assistant")
+    st.markdown("---")
     
     # Model selection
-    model_choice = st.selectbox(
-        "Select OpenAI Model",
+    selected_model = st.selectbox(
+        "Model",
         ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
         index=1
     )
     
-    # Clear chat button
-    if st.button("🗑️ Clear Chat History"):
+    # Temperature
+    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
+    
+    # RAG toggle
+    use_rag = st.toggle("Use RAG (Memory)", value=True)
+    
+    st.markdown("---")
+    
+    # Stats
+    st.subheader("📊 Stats")
+    try:
+        stats = vector_store.get_stats()
+        st.metric("Conversations Stored", stats.get("total_vectors", 0))
+    except:
+        st.metric("Conversations Stored", "N/A")
+    
+    st.metric("Messages in Chat", len(st.session_state.messages))
+    
+    st.markdown("---")
+    
+    # Clear chat
+    if st.button("🗑️ New Chat", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.conversation_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.rerun()
 
+# Main chat interface
+st.title("💬 AI Chat Assistant")
 
-# Initialize Pinecone
-def init_pinecone():
-    if pinecone_api_key:
-        try:
-            pc = Pinecone(api_key=pinecone_api_key)
-            
-            # Create index if it doesn't exist
-            if pinecone_index_name not in [index.name for index in pc.list_indexes()]:
-                pc.create_index(
-                    name=pinecone_index_name,
-                    dimension=1536,  # OpenAI embedding dimension
-                    metric='cosine',
-                    spec=ServerlessSpec(
-                        cloud='aws',
-                        region='us-east-1'
-                    )
-                )
-            
-            return pc.Index(pinecone_index_name)
-        except Exception as e:
-            st.sidebar.error(f"Pinecone Error: {str(e)}")
-            return None
-    return None
-
-# Initialize OpenAI client
-def init_openai():
-    if openai_api_key:
-        openai.api_key = openai_api_key
-        return True
-    return False
-
-# Function to encode image to base64
-def encode_image(image):
-    buffered = BytesIO()
-    image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode()
-
-# Function to get embeddings
-def get_embedding(text):
-    try:
-        response = openai.embeddings.create(
-            input=text,
-            model="text-embedding-ada-002"
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        st.error(f"Embedding Error: {str(e)}")
-        return None
-
-# Function to store message in Pinecone
-def store_in_pinecone(index, message_id, text, metadata):
-    if index:
-        try:
-            embedding = get_embedding(text)
-            if embedding:
-                index.upsert([(message_id, embedding, metadata)])
-        except Exception as e:
-            st.sidebar.warning(f"Storage Error: {str(e)}")
-
-# Function to query Pinecone for similar messages
-def query_pinecone(index, query_text, top_k=3):
-    if index:
-        try:
-            query_embedding = get_embedding(query_text)
-            if query_embedding:
-                results = index.query(
-                    vector=query_embedding,
-                    top_k=top_k,
-                    include_metadata=True
-                )
-                return results.matches
-        except Exception as e:
-            st.sidebar.warning(f"Query Error: {str(e)}")
-    return []
-
-# Initialize session state for messages
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Initialize clients
-openai_ready = init_openai()
-pinecone_index = init_pinecone()
-
-# Display chat messages
+# Display chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        if "content" in message:
-            st.markdown(message["content"])
-        if "image" in message:
-            st.image(message["image"], width=300)
-
-# Image upload
-uploaded_image = st.file_uploader("📷 Upload an image (optional)", type=["png", "jpg", "jpeg"])
+        st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Type your message here..."):
-    if not openai_ready:
-        st.error("⚠️ Please enter your OpenAI API key in the sidebar")
-    else:
-        # Add user message to chat
-        user_message = {"role": "user", "content": prompt}
-        
-        # Handle image if uploaded
-        image_data = None
-        if uploaded_image:
-            image = Image.open(uploaded_image)
-            user_message["image"] = image
-            image_data = encode_image(image)
-        
-        st.session_state.messages.append(user_message)
-        
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
-            if uploaded_image:
-                st.image(image, width=300)
-        
-        # Store in Pinecone
-        if pinecone_index:
-            message_id = f"msg_{len(st.session_state.messages)}"
-            store_in_pinecone(
-                pinecone_index,
-                message_id,
-                prompt,
-                {"role": "user", "content": prompt}
-            )
-        
-        # Prepare messages for OpenAI
-        messages_for_api = []
-        
-        # Add context from Pinecone if available
-        if pinecone_index:
-            similar_messages = query_pinecone(pinecone_index, prompt)
-            if similar_messages:
-                context = "Previous relevant conversations:\n"
-                for match in similar_messages:
-                    context += f"- {match.metadata.get('content', '')}\n"
-                messages_for_api.append({"role": "system", "content": context})
-        
-        # Add conversation history
-        for msg in st.session_state.messages[-5:]:  # Last 5 messages for context
-            if "image" in msg and image_data:
-                messages_for_api.append({
-                    "role": msg["role"],
-                    "content": [
-                        {"type": "text", "text": msg["content"]},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}}
-                    ]
-                })
-            else:
-                messages_for_api.append({"role": msg["role"], "content": msg.get("content", "")})
-        
-        # Get AI response
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            full_response = ""
-            
-            try:
-                # Stream response
-                stream = openai.chat.completions.create(
-                    model=model_choice,
-                    messages=messages_for_api,
-                    stream=True,
-                    max_tokens=1000
-                )
-                
-                for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        full_response += chunk.choices[0].delta.content
-                        message_placeholder.markdown(full_response + "▌")
-                
-                message_placeholder.markdown(full_response)
-                
-                # Add assistant message to chat history
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                
-                # Store in Pinecone
-                if pinecone_index:
-                    message_id = f"msg_{len(st.session_state.messages)}"
-                    store_in_pinecone(
-                        pinecone_index,
-                        message_id,
-                        full_response,
-                        {"role": "assistant", "content": full_response}
-                    )
-                    
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                st.error("Please check your API keys and try again.")
-
-# Sidebar stats
-if pinecone_index:
-    with st.sidebar:
-        st.divider()
-        st.subheader("📊 Stats")
+if prompt := st.chat_input("Message AI Assistant..."):
+    # Add user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Get RAG context if enabled
+    context_messages = []
+    if use_rag and len(st.session_state.messages) > 1:
         try:
-            stats = pinecone_index.describe_index_stats()
-            st.metric("Vectors Stored", stats.total_vector_count)
-        except:
-            pass
+            similar_convos = vector_store.search_similar(prompt, k=2)
+            if similar_convos:
+                context = "\n\n".join([f"Previous context: {conv['content']}" for conv in similar_convos])
+                context_messages = [{
+                    "role": "system",
+                    "content": f"Here is some relevant context from previous conversations:\n{context}"
+                }]
+        except Exception as e:
+            st.error(f"RAG error: {e}")
+    
+    # Prepare messages for LLM
+    system_message = {
+        "role": "system",
+        "content": "You are a helpful AI assistant. Provide clear, concise, and accurate responses."
+    }
+    
+    llm_messages = [system_message] + context_messages + st.session_state.messages[-10:]  # Last 10 messages
+    
+    # Get AI response with streaming
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        try:
+            # Stream the response
+            for chunk in chat_engine.get_response(llm_messages, stream=True):
+                if chunk:
+                    full_response += chunk
+                    message_placeholder.markdown(full_response + "▌")
+            
+            message_placeholder.markdown(full_response)
+            
+            # Add to chat history
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            
+            # Store in vector database
+            if use_rag:
+                try:
+                    vector_store.add_conversation(
+                        user_message=prompt,
+                        ai_message=full_response,
+                        metadata={
+                            "conversation_id": st.session_state.conversation_id,
+                            "timestamp": datetime.now().isoformat(),
+                            "model": selected_model
+                        }
+                    )
+                except Exception as e:
+                    st.error(f"Error storing conversation: {e}")
+                    
+        except Exception as e:
+            st.error(f"❌ Error generating response: {str(e)}")
+
+# Footer
+st.markdown("---")
+st.caption("Powered by OpenAI
