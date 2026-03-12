@@ -399,8 +399,7 @@ if prompt := st.chat_input("Message AI Assistant..."):
             })
         else:
             # Add document content as
-file_context += f"\n{file_data['name']}: {file_data['content'][:500]}"
-    
+            file_context += f"\n{file_data['name']}: {file_data['content'][:500]}"    
     if file_context:
         user_message_content.append({"type": "text", "text": f"\n\nFiles: {file_context}"})
     
