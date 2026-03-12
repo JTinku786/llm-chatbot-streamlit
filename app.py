@@ -399,3 +399,4 @@ if prompt := st.chat_input("Message AI Assistant..."):
             })
         else:
             # Add document content as
+                        pass
