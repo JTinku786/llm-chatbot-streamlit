@@ -11,7 +11,7 @@ import base64
 from io import BytesIO
 from datetime import datetime
 import json
-import PyPDF2
+from pypdf import PdfReader
 from pptx import Presentation
 import docx
 
@@ -150,7 +150,7 @@ def encode_image_to_base64(image):
 def extract_text_from_pdf(pdf_file):
     """Extract text from PDF file."""
     try:
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        pdf_reader = PdfReader(pdf_file)
         text = ""
         for page in pdf_reader.pages:
             text += page.extract_text() + "\n"
