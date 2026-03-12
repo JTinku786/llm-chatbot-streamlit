@@ -20,7 +20,7 @@ st.set_page_config(
     page_title="AI Chat Assistant",
     page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # Custom CSS for ChatGPT-style UI
