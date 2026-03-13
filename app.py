@@ -119,15 +119,16 @@ config = load_config()
 if not config:
     st.stop()
 
+client = OpenAI(api_key=config["openai_api_key"])
+
 
 # Initialize Pinecone
 @st.cache_resource
 def init_pinecone():
-    client = OpenAI(api_key=config["openai_api_key"])
     try:
         pc = Pinecone(api_key=config["pinecone_api_key"])
-# Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
-    return pc.Index(config["pinecone_index_name"])
+        # Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
+        return pc.Index(config["pinecone_index_name"])
     except Exception as e:
         st.sidebar.error(f"Pinecone Error: {str(e)}")
         return None
