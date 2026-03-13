@@ -18,6 +18,7 @@ import json
 import re
 import requests
 from pypdf import PdfReader
+from src.rag.ict_rag import resolve_index, build_sparse_vector, run_pinecone_query, rerank_documents, transform_query
 from pptx import Presentation
 import docx
 
@@ -121,7 +122,9 @@ def load_config():
             "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
             "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", ""),
             "serpapi_api_key": st.secrets.get("SERPAPI_API_KEY", ""),
-            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", "")
+            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", ""),
+            "cohere_api_key": st.secrets.get("COHERE_API_KEY", ""),
+            "ict_pinecone_index_name": st.secrets.get("ICT_PINECONE_INDEX_NAME", st.secrets.get("PINECONE_INDEX_NAME", "ict-memory"))
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -369,6 +372,107 @@ def route_tools(prompt, provider):
         ) = load_web_search_context(routing["search_query"], provider)
 
     return routing
+
+
+@traceable(name="ict_rag_pipeline", run_type="chain")
+def run_ict_rag_pipeline(query, retrieval_mode, reranker, query_strategy, top_k, llm_model):
+    """End-to-end ICT RAG pipeline (query transform -> retrieve -> rerank -> context)."""
+    host, index_dimension, resolve_error = resolve_index(
+        config["ict_pinecone_index_name"],
+        config["pinecone_api_key"],
+    )
+    if resolve_error:
+        return {"context": "", "sources": [], "error": resolve_error}
+
+    query_variants = transform_query(client, query, query_strategy, llm_model)
+    all_docs = []
+    seen_ids = set()
+
+    for q in query_variants:
+        dense_vector = None
+        sparse_vector = None
+
+        if retrieval_mode in {"Dense", "Hybrid"}:
+            embed_params = {"model": "text-embedding-3-small", "input": q}
+            if index_dimension and int(index_dimension) <= 1536:
+                embed_params["dimensions"] = int(index_dimension)
+            dense_vector = client.embeddings.create(**embed_params).data[0].embedding
+
+        if retrieval_mode in {"Sparse", "Hybrid"}:
+            sparse_vector = build_sparse_vector(q)
+
+        matches, query_error = run_pinecone_query(
+            host=host,
+            api_key=config["pinecone_api_key"],
+            top_k=top_k,
+            dense_vector=dense_vector,
+            sparse_vector=sparse_vector,
+        )
+
+        if query_error and retrieval_mode == "Hybrid" and dense_vector is not None:
+            matches, query_error = run_pinecone_query(
+                host=host,
+                api_key=config["pinecone_api_key"],
+                top_k=top_k,
+                dense_vector=dense_vector,
+                sparse_vector=None,
+            )
+
+        if query_error:
+            return {"context": "", "sources": [], "error": query_error}
+
+        for m in matches:
+            doc_id = m.get("id")
+            if not doc_id or doc_id in seen_ids:
+                continue
+            seen_ids.add(doc_id)
+            meta = m.get("metadata", {}) or {}
+            all_docs.append(
+                {
+                    "id": doc_id,
+                    "score": m.get("score", 0),
+                    "source": meta.get("source", "unknown"),
+                    "chunk_id": meta.get("chunk_id", ""),
+                    "text": meta.get("text") or meta.get("assistant_message") or "",
+                }
+            )
+
+    if not all_docs:
+        return {"context": "", "sources": [], "error": "No ICT context found for this query."}
+
+    reranked = rerank_documents(
+        client=client,
+        query=query,
+        docs=all_docs,
+        reranker=reranker,
+        cohere_api_key=config.get("cohere_api_key", ""),
+        embedding_model="text-embedding-3-small",
+    )
+    top_docs = reranked[:top_k]
+
+    context_parts = []
+    sources = []
+    for idx, doc in enumerate(top_docs, start=1):
+        context_parts.append(
+            f"[{idx}] source={doc['source']} chunk_id={doc['chunk_id']} score={doc.get('score', 0):.4f} rerank={doc.get('rerank_score', 0):.4f}\n{doc['text'][:1400]}"
+        )
+        sources.append(
+            {
+                "id": doc["id"],
+                "source": doc["source"],
+                "chunk_id": doc["chunk_id"],
+                "score": doc.get("score", 0),
+                "rerank_score": doc.get("rerank_score", 0),
+            }
+        )
+
+    return {
+        "context": "\n\n".join(context_parts),
+        "sources": sources,
+        "error": "",
+        "query_variants": query_variants,
+    }
+
 
 def get_pinecone_index():
     """Resolve Pinecone index host + dimension using Pinecone REST API."""
@@ -693,7 +797,27 @@ with st.sidebar:
         index=0,
         help="Used when you ask with /search, search, google, or look up."
     )
-    
+
+    st.markdown("### 📚 ICT Concept RAG")
+    use_ict_rag = st.checkbox("Include ICT Concept Technology (RAG)", value=False)
+    rag_retrieval_mode = st.selectbox(
+        "Retrieval Technique",
+        ["Hybrid", "Dense", "Sparse"],
+        index=0,
+        help="Hybrid uses both dense and sparse retrieval signals."
+    )
+    rag_reranker = st.selectbox(
+        "Reranker",
+        ["Cohere Rerank", "BGE reranker", "ColBERT"],
+        index=0,
+    )
+    rag_query_strategy = st.selectbox(
+        "Query Strategy",
+        ["HyDE", "Query Expansion", "Query Decomposition"],
+        index=0,
+    )
+    rag_top_k = st.slider("RAG Top-K", 3, 20, 8)
+
     st.markdown("---")
     st.markdown("### 📊 Stats")
     st.metric("Total Chats", len(st.session_state.all_chats))
@@ -745,7 +869,7 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Ask anything... (tools auto-route for weather/live web info)"):
+if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RAG)"):
     # Prepare user message content
     user_message_content = []
 
@@ -762,6 +886,31 @@ if prompt := st.chat_input("Ask anything... (tools auto-route for weather/live w
         st.warning(routing["search_error"])
     elif search_context:
         st.info(f"Loaded web search context from {routing['provider_used']} for: {routing['search_query']}")
+
+    ict_context = ""
+    if use_ict_rag:
+        rag_result = run_ict_rag_pipeline(
+            query=prompt,
+            retrieval_mode=rag_retrieval_mode,
+            reranker=rag_reranker,
+            query_strategy=rag_query_strategy,
+            top_k=rag_top_k,
+            llm_model=selected_model,
+        )
+        if rag_result.get("error"):
+            st.warning(f"ICT RAG skipped: {rag_result['error']}")
+        else:
+            ict_context = rag_result.get("context", "")
+            st.info(
+                f"ICT RAG loaded ({rag_retrieval_mode} + {rag_reranker} + {rag_query_strategy}) "
+                f"with {len(rag_result.get('sources', []))} chunks."
+            )
+            with st.expander("📚 ICT RAG Sources", expanded=False):
+                for src in rag_result.get("sources", []):
+                    st.markdown(
+                        f"- `{src['source']}` | chunk `{src['chunk_id']}` | "
+                        f"score `{src['score']:.4f}` | rerank `{src['rerank_score']:.4f}`"
+                    )
 
     # Add text
     user_message_content.append({"type": "text", "text": prompt})
@@ -788,6 +937,15 @@ if prompt := st.chat_input("Ask anything... (tools auto-route for weather/live w
 
     if search_context:
         user_message_content.append({"type": "text", "text": f"\n\nWeb search context:\n{search_context}\n\nUse this context with citations when relevant."})
+
+    if ict_context:
+        user_message_content.append({
+            "type": "text",
+            "text": (
+                "\n\nICT Concept RAG context (use this as primary evidence and cite sources):\n"
+                f"{ict_context}"
+            ),
+        })
 
     current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
     
