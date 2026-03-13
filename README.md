@@ -80,3 +80,6 @@ If LangSmith still shows `output: false` or `success: false` for `store_conversa
 4. Check `reason` and `error_type` fields in the run output/sidebar for exact failure cause.
 5. If using a custom index dimension, the app now adapts embedding dimensions up to 1536 for `text-embedding-3-small`.
 6. The Streamlit app writes to Pinecone via REST (no direct `pinecone` SDK import), which avoids deprecated plugin import crashes in some hosted environments.
+
+
+Note: Pinecone upserts use the default namespace (no explicit namespace field) for compatibility with serverless index APIs.

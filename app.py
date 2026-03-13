@@ -449,16 +449,29 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "source": "streamlit_chat",
         }
 
+        upsert_payload = {
+            "vectors": [{"id": vector_id, "values": embedding, "metadata": metadata}]
+        }
         upsert_response = requests.post(
             f"https://{index_host}/vectors/upsert",
             headers={**headers, "Content-Type": "application/json"},
-            json={
-                "vectors": [{"id": vector_id, "values": embedding, "metadata": metadata}],
-                "namespace": "__default__",
-            },
+            json=upsert_payload,
             timeout=15,
         )
-        upsert_response.raise_for_status()
+
+        if upsert_response.status_code >= 400:
+            error_body = upsert_response.text[:1000]
+            return {
+                "success": False,
+                "reason": (
+                    f"Pinecone REST upsert failed: HTTP {upsert_response.status_code}. "
+                    f"Response: {error_body}"
+                ),
+                "vector_id": "",
+                "error_type": "HTTPError",
+                "index_dimension": index_dimension,
+                "embedding_length": len(embedding),
+            }
 
         return {
             "success": True,
@@ -466,6 +479,7 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "vector_id": vector_id,
             "error_type": "",
             "index_dimension": index_dimension,
+            "embedding_length": len(embedding),
         }
     except requests.RequestException as exc:
         return {
@@ -474,6 +488,7 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "vector_id": "",
             "error_type": type(exc).__name__,
             "index_dimension": index_dimension,
+            "embedding_length": 0,
         }
     except Exception as exc:
         return {
