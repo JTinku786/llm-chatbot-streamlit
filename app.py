@@ -5,7 +5,7 @@ Built with OpenAI, Pinecone, and Advanced Document Processing
 
 import streamlit as st
 from openai  import OpenAI
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 from PIL import Image
 import base64
 from io import BytesIO
@@ -126,14 +126,8 @@ def init_pinecone():
     client = OpenAI(api_key=config["openai_api_key"])
     try:
         pc = Pinecone(api_key=config["pinecone_api_key"])
-        if config["pinecone_index_name"] not in [index.name for index in pc.list_indexes()]:
-            pc.create_index(
-                name=config["pinecone_index_name"],
-                dimension=1536,
-                metric='cosine',
-                spec=ServerlessSpec(cloud='aws', region='us-east-1')
-            )
-        return pc.Index(config["pinecone_index_name"])
+# Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
+            return pc.Index(config["pinecone_index_name"]
     except Exception as e:
         st.sidebar.error(f"Pinecone Error: {str(e)}")
         return None
