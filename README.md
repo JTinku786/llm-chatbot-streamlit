@@ -44,3 +44,15 @@ Add secrets in Streamlit Cloud:
 - `SERPAPI_API_KEY`
 
 In `Auto` mode, the app tries Tavily first, then SerpAPI.
+
+
+## Tool routing strategy
+
+The app now uses a lightweight tool router before each LLM call:
+
+1. Inspect user prompt for weather or live-web intent.
+2. Call weather or web-search tools when needed.
+3. Attach fetched context to the user message.
+4. Send enriched context to the LLM for final response.
+
+This routing is traced in LangSmith with dedicated runs (`tool_router`, `weather_context`, `web_search_context`, `search_tavily`, `search_serpapi`).

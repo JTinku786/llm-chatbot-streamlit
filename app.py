@@ -170,6 +170,7 @@ def extract_search_query(prompt):
     return ''
 
 
+@traceable(name="search_serpapi", run_type="tool")
 def search_with_serpapi(query, max_results=5):
     """Fetch search results from SerpAPI."""
     if not config["serpapi_api_key"]:
@@ -201,6 +202,7 @@ def search_with_serpapi(query, max_results=5):
         return [], f"SerpAPI search failed: {exc}"
 
 
+@traceable(name="search_tavily", run_type="tool")
 def search_with_tavily(query, max_results=5):
     """Fetch search results from Tavily."""
     if not config["tavily_api_key"]:
@@ -235,6 +237,7 @@ def search_with_tavily(query, max_results=5):
         return [], f"Tavily search failed: {exc}"
 
 
+@traceable(name="web_search_context", run_type="tool")
 def load_web_search_context(query, provider):
     """Load web search context from selected provider."""
     provider_order = {
@@ -262,6 +265,7 @@ def load_web_search_context(query, provider):
 
     return "", "", " | ".join(errors) if errors else "No search results found."
 
+
 def extract_weather_cities(prompt):
     """Extract city names from weather-related prompts."""
     prompt_clean = prompt.strip()
@@ -271,6 +275,12 @@ def extract_weather_cities(prompt):
         city_fragment = prompt_clean[len('/weather '):]
     elif 'weather in ' in prompt_lower:
         start = prompt_lower.find('weather in ') + len('weather in ')
+        city_fragment = prompt_clean[start:]
+    elif 'temperature in ' in prompt_lower:
+        start = prompt_lower.find('temperature in ') + len('temperature in ')
+        city_fragment = prompt_clean[start:]
+    elif 'forecast in ' in prompt_lower:
+        start = prompt_lower.find('forecast in ') + len('forecast in ')
         city_fragment = prompt_clean[start:]
     elif prompt_lower.startswith('weather '):
         city_fragment = prompt_clean[len('weather '):]
@@ -286,6 +296,8 @@ def extract_weather_cities(prompt):
     parts = re.split(r',|\band\b|&', city_fragment, flags=re.IGNORECASE)
     return [part.strip(' .') for part in parts if part.strip(' .')]
 
+
+@traceable(name="weather_context", run_type="tool")
 def load_weather_context(cities):
     """Load weather context for the given cities using OpenWeatherMap."""
     if not config["openweathermap_api_key"]:
@@ -319,6 +331,43 @@ def load_weather_context(cities):
         return "\n".join(weather_reports), ""
     except requests.RequestException as exc:
         return "", f"Weather lookup failed: {exc}"
+
+
+@traceable(name="tool_router", run_type="chain")
+def route_tools(prompt, provider):
+    """Decide whether tools are needed and fetch context before LLM call."""
+    routing = {
+        "weather_context": "",
+        "weather_error": "",
+        "weather_cities": [],
+        "search_context": "",
+        "search_error": "",
+        "search_query": "",
+        "provider_used": "",
+    }
+
+    city_list = extract_weather_cities(prompt)
+    if city_list:
+        routing["weather_cities"] = city_list
+        routing["weather_context"], routing["weather_error"] = load_weather_context(city_list)
+
+    explicit_search_query = extract_search_query(prompt)
+    time_sensitive_pattern = r"\b(as of|latest|current|today|breaking|recent|news|update|updates|happening now)\b"
+    needs_fresh_info = bool(re.search(time_sensitive_pattern, prompt, flags=re.IGNORECASE))
+
+    if explicit_search_query:
+        routing["search_query"] = explicit_search_query
+    elif needs_fresh_info and not city_list:
+        routing["search_query"] = prompt.strip()
+
+    if routing["search_query"]:
+        (
+            routing["search_context"],
+            routing["provider_used"],
+            routing["search_error"],
+        ) = load_web_search_context(routing["search_query"], provider)
+
+    return routing
 
 # Helper functions for file processing
 def encode_image_to_base64(image):
@@ -565,27 +614,23 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Ask anything... (weather in city, /weather, /search)"):
+if prompt := st.chat_input("Ask anything... (tools auto-route for weather/live web info)"):
     # Prepare user message content
     user_message_content = []
 
-    weather_context = ""
-    city_list = extract_weather_cities(prompt)
-    if city_list:
-        weather_context, weather_error = load_weather_context(city_list)
-        if weather_error:
-            st.warning(weather_error)
-        elif weather_context:
-            st.info(f"Fetched weather data for: {', '.join(city_list)}")
+    routing = route_tools(prompt, web_search_provider)
+    weather_context = routing["weather_context"]
+    search_context = routing["search_context"]
 
-    search_context = ""
-    search_query = extract_search_query(prompt)
-    if search_query:
-        search_context, provider_used, search_error = load_web_search_context(search_query, web_search_provider)
-        if search_error:
-            st.warning(search_error)
-        elif search_context:
-            st.info(f"Loaded web search context from {provider_used} for: {search_query}")
+    if routing["weather_error"]:
+        st.warning(routing["weather_error"])
+    elif weather_context:
+        st.info(f"Fetched weather data for: {', '.join(routing['weather_cities'])}")
+
+    if routing["search_error"]:
+        st.warning(routing["search_error"])
+    elif search_context:
+        st.info(f"Loaded web search context from {routing['provider_used']} for: {routing['search_query']}")
 
     # Add text
     user_message_content.append({"type": "text", "text": prompt})
