@@ -3,14 +3,20 @@ Modern ChatGPT/Perplexity-style LLM Application with Multi-Chat & File Upload
 Built with OpenAI, Pinecone, and Advanced Document Processing
 """
 
+import os
+
 import streamlit as st
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 from openai  import OpenAI
-from pinecone import Pinecone
 from PIL import Image
 import base64
 from io import BytesIO
 from datetime import datetime
+import uuid
 import json
+import re
+import requests
 from pypdf import PdfReader
 from pptx import Presentation
 import docx
@@ -107,9 +113,15 @@ def load_config():
     try:
         return {
             "openai_api_key": st.secrets["OPENAI_API_KEY"],
-            "pinecone_api_key": st.secrets["PINECONE_API_KEY"],
+            "pinecone_api_key": st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY", "")),
             "pinecone_environment": st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter"),
-            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory")
+            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", os.getenv("PINECONE_INDEX_NAME", "chatbot-memory")),
+            "langsmith_api_key": st.secrets.get("LANGSMITH_API_KEY", ""),
+            "langsmith_project": st.secrets.get("LANGSMITH_PROJECT", "llm-chatbot-streamlit"),
+            "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
+            "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", ""),
+            "serpapi_api_key": st.secrets.get("SERPAPI_API_KEY", ""),
+            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", "")
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -119,20 +131,374 @@ config = load_config()
 if not config:
     st.stop()
 
+if config["langsmith_api_key"]:
+    os.environ["LANGSMITH_API_KEY"] = config["langsmith_api_key"]
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_PROJECT"] = config["langsmith_project"]
+    os.environ["LANGSMITH_ENDPOINT"] = config["langsmith_endpoint"]
 
-# Initialize Pinecone
-@st.cache_resource
-def init_pinecone():
-    client = OpenAI(api_key=config["openai_api_key"])
+client = wrap_openai(OpenAI(api_key=config["openai_api_key"]))
+
+@traceable(name="chat_completion_stream", run_type="llm")
+def stream_chat_completion(selected_model, messages, temperature):
+    return client.chat.completions.create(
+        model=selected_model,
+        messages=messages,
+        temperature=temperature,
+        stream=True
+    )
+
+
+
+
+
+
+
+def extract_search_query(prompt):
+    """Extract web-search query from user prompt."""
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+
+    if prompt_lower.startswith('/search '):
+        return prompt_clean[len('/search '):].strip()
+    if prompt_lower.startswith('search '):
+        return prompt_clean[len('search '):].strip()
+    if prompt_lower.startswith('google '):
+        return prompt_clean[len('google '):].strip()
+    if prompt_lower.startswith('look up '):
+        return prompt_clean[len('look up '):].strip()
+
+    return ''
+
+
+@traceable(name="search_serpapi", run_type="tool")
+def search_with_serpapi(query, max_results=5):
+    """Fetch search results from SerpAPI."""
+    if not config["serpapi_api_key"]:
+        return [], "SERPAPI_API_KEY is not configured."
+
     try:
-        pc = Pinecone(api_key=config["pinecone_api_key"])
-# Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
-    return pc.Index(config["pinecone_index_name"])
-    except Exception as e:
-        st.sidebar.error(f"Pinecone Error: {str(e)}")
-        return None
+        response = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "q": query,
+                "api_key": config["serpapi_api_key"],
+                "num": max_results,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("organic_results", [])[:max_results]
+        results = [
+            {
+                "title": item.get("title", "Untitled"),
+                "snippet": item.get("snippet", ""),
+                "url": item.get("link", ""),
+            }
+            for item in items
+        ]
+        return results, ""
+    except requests.RequestException as exc:
+        return [], f"SerpAPI search failed: {exc}"
 
-pinecone_index = init_pinecone()
+
+@traceable(name="search_tavily", run_type="tool")
+def search_with_tavily(query, max_results=5):
+    """Fetch search results from Tavily."""
+    if not config["tavily_api_key"]:
+        return [], "TAVILY_API_KEY is not configured."
+
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": config["tavily_api_key"],
+                "query": query,
+                "max_results": max_results,
+                "include_answer": True,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("results", [])[:max_results]
+        results = [
+            {
+                "title": item.get("title", "Untitled"),
+                "snippet": item.get("content", ""),
+                "url": item.get("url", ""),
+            }
+            for item in items
+        ]
+        if data.get("answer"):
+            results.insert(0, {"title": "Tavily Answer", "snippet": data["answer"], "url": ""})
+        return results[:max_results], ""
+    except requests.RequestException as exc:
+        return [], f"Tavily search failed: {exc}"
+
+
+@traceable(name="web_search_context", run_type="tool")
+def load_web_search_context(query, provider):
+    """Load web search context from selected provider."""
+    provider_order = {
+        "Auto": ["Tavily", "SerpAPI"],
+        "Tavily": ["Tavily"],
+        "SerpAPI": ["SerpAPI"],
+    }
+
+    provider_map = {
+        "Tavily": search_with_tavily,
+        "SerpAPI": search_with_serpapi,
+    }
+
+    errors = []
+    for provider_name in provider_order.get(provider, [provider]):
+        results, error = provider_map[provider_name](query)
+        if results:
+            lines = [
+                f"[{idx}] {item['title']}\n{item['snippet']}\n{item['url']}"
+                for idx, item in enumerate(results, start=1)
+            ]
+            return "\n\n".join(lines), provider_name, ""
+        if error:
+            errors.append(f"{provider_name}: {error}")
+
+    return "", "", " | ".join(errors) if errors else "No search results found."
+
+
+def extract_weather_cities(prompt):
+    """Extract city names from weather-related prompts."""
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+
+    if prompt_lower.startswith('/weather '):
+        city_fragment = prompt_clean[len('/weather '):]
+    elif 'weather in ' in prompt_lower:
+        start = prompt_lower.find('weather in ') + len('weather in ')
+        city_fragment = prompt_clean[start:]
+    elif 'temperature in ' in prompt_lower:
+        start = prompt_lower.find('temperature in ') + len('temperature in ')
+        city_fragment = prompt_clean[start:]
+    elif 'forecast in ' in prompt_lower:
+        start = prompt_lower.find('forecast in ') + len('forecast in ')
+        city_fragment = prompt_clean[start:]
+    elif prompt_lower.startswith('weather '):
+        city_fragment = prompt_clean[len('weather '):]
+    else:
+        return []
+
+    city_fragment = re.split(r'[?.!\n]', city_fragment, maxsplit=1)[0]
+    city_fragment = city_fragment.strip()
+    if not city_fragment:
+        return []
+
+    city_fragment = re.sub(r'\b(today|now|currently|please)\b', '', city_fragment, flags=re.IGNORECASE).strip()
+    parts = re.split(r',|\band\b|&', city_fragment, flags=re.IGNORECASE)
+    return [part.strip(' .') for part in parts if part.strip(' .')]
+
+
+@traceable(name="weather_context", run_type="tool")
+def load_weather_context(cities):
+    """Load weather context for the given cities using OpenWeatherMap."""
+    if not config["openweathermap_api_key"]:
+        return "", "OPENWEATHERMAP_API_KEY is not configured."
+
+    clean_cities = [city.strip() for city in cities if city and city.strip()]
+    if not clean_cities:
+        return "", "No valid city names provided."
+
+    try:
+        weather_reports = []
+        for city in clean_cities:
+            response = requests.get(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={
+                    "q": city,
+                    "appid": config["openweathermap_api_key"],
+                    "units": "metric",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            weather_reports.append(
+                f"{data['name']}: {data['weather'][0]['description']}, "
+                f"temperature {data['main']['temp']}°C, feels like {data['main']['feels_like']}°C, "
+                f"humidity {data['main']['humidity']}%, wind {data['wind']['speed']} m/s"
+            )
+
+        return "\n".join(weather_reports), ""
+    except requests.RequestException as exc:
+        return "", f"Weather lookup failed: {exc}"
+
+
+@traceable(name="tool_router", run_type="chain")
+def route_tools(prompt, provider):
+    """Decide whether tools are needed and fetch context before LLM call."""
+    routing = {
+        "weather_context": "",
+        "weather_error": "",
+        "weather_cities": [],
+        "search_context": "",
+        "search_error": "",
+        "search_query": "",
+        "provider_used": "",
+    }
+
+    city_list = extract_weather_cities(prompt)
+    if city_list:
+        routing["weather_cities"] = city_list
+        routing["weather_context"], routing["weather_error"] = load_weather_context(city_list)
+
+    explicit_search_query = extract_search_query(prompt)
+    time_sensitive_pattern = r"\b(as of|latest|current|today|breaking|recent|news|update|updates|happening now)\b"
+    needs_fresh_info = bool(re.search(time_sensitive_pattern, prompt, flags=re.IGNORECASE))
+
+    if explicit_search_query:
+        routing["search_query"] = explicit_search_query
+    elif needs_fresh_info and not city_list:
+        routing["search_query"] = prompt.strip()
+
+    if routing["search_query"]:
+        (
+            routing["search_context"],
+            routing["provider_used"],
+            routing["search_error"],
+        ) = load_web_search_context(routing["search_query"], provider)
+
+    return routing
+
+def get_pinecone_index():
+    """Resolve Pinecone index host + dimension using Pinecone REST API."""
+    if not config["pinecone_api_key"]:
+        return None, None, "PINECONE_API_KEY is not configured.", None
+
+    index_name = config["pinecone_index_name"]
+    headers = {
+        "Api-Key": config["pinecone_api_key"],
+        "Accept": "application/json",
+    }
+
+    try:
+        response = requests.get(
+            f"https://api.pinecone.io/indexes/{index_name}",
+            headers=headers,
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return None, None, f"Pinecone index '{index_name}' does not exist.", None
+
+        response.raise_for_status()
+        data = response.json()
+
+        host = data.get("host") or data.get("status", {}).get("host")
+        dimension = data.get("dimension")
+        if dimension is None:
+            spec = data.get("spec", {})
+            dimension = spec.get("dimension")
+
+        if not host:
+            return None, None, "Pinecone index host could not be resolved.", None
+
+        return host, headers, "", dimension
+    except requests.RequestException as exc:
+        return None, None, f"Pinecone index lookup failed: {exc}", None
+
+
+@traceable(name="store_conversation_pinecone", run_type="tool")
+def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
+    """Store a single user/assistant turn in Pinecone via REST upsert."""
+    index_host, headers, init_error, index_dimension = get_pinecone_index()
+    if not index_host:
+        return {
+            "success": False,
+            "reason": init_error,
+            "vector_id": "",
+            "error_type": "init_error",
+            "index_dimension": index_dimension,
+        }
+
+    text_payload = f"User: {user_message}\nAssistant: {assistant_message}"
+
+    try:
+        embedding_params = {
+            "model": "text-embedding-3-small",
+            "input": text_payload,
+        }
+        if index_dimension:
+            if int(index_dimension) > 1536:
+                return {
+                    "success": False,
+                    "reason": f"Index dimension {index_dimension} is larger than text-embedding-3-small max 1536.",
+                    "vector_id": "",
+                    "error_type": "dimension_mismatch",
+                    "index_dimension": index_dimension,
+                }
+            embedding_params["dimensions"] = int(index_dimension)
+
+        embedding = client.embeddings.create(**embedding_params).data[0].embedding
+
+        vector_id = f"{chat_id}-{uuid.uuid4()}"
+        metadata = {
+            "chat_id": chat_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "user_message": user_message[:2000],
+            "assistant_message": assistant_message[:2000],
+            "source": "streamlit_chat",
+        }
+
+        upsert_payload = {
+            "vectors": [{"id": vector_id, "values": embedding, "metadata": metadata}]
+        }
+        upsert_response = requests.post(
+            f"https://{index_host}/vectors/upsert",
+            headers={**headers, "Content-Type": "application/json"},
+            json=upsert_payload,
+            timeout=15,
+        )
+
+        if upsert_response.status_code >= 400:
+            error_body = upsert_response.text[:1000]
+            return {
+                "success": False,
+                "reason": (
+                    f"Pinecone REST upsert failed: HTTP {upsert_response.status_code}. "
+                    f"Response: {error_body}"
+                ),
+                "vector_id": "",
+                "error_type": "HTTPError",
+                "index_dimension": index_dimension,
+                "embedding_length": len(embedding),
+            }
+
+        return {
+            "success": True,
+            "reason": "",
+            "vector_id": vector_id,
+            "error_type": "",
+            "index_dimension": index_dimension,
+            "embedding_length": len(embedding),
+        }
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "reason": f"Pinecone REST upsert failed: {exc}",
+            "vector_id": "",
+            "error_type": type(exc).__name__,
+            "index_dimension": index_dimension,
+            "embedding_length": 0,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "reason": f"Pinecone upsert failed: {exc}",
+            "vector_id": "",
+            "error_type": type(exc).__name__,
+            "index_dimension": index_dimension,
+        }
+
 
 # Helper functions for file processing
 def encode_image_to_base64(image):
@@ -321,6 +687,12 @@ with st.sidebar:
     
     temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
     use_rag = st.toggle("Use Memory (RAG)", value=True)
+    web_search_provider = st.selectbox(
+        "Web Search Provider",
+        ["Auto", "Tavily", "SerpAPI"],
+        index=0,
+        help="Used when you ask with /search, search, google, or look up."
+    )
     
     st.markdown("---")
     st.markdown("### 📊 Stats")
@@ -373,10 +745,24 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Message AI Assistant..."):
+if prompt := st.chat_input("Ask anything... (tools auto-route for weather/live web info)"):
     # Prepare user message content
     user_message_content = []
-    
+
+    routing = route_tools(prompt, web_search_provider)
+    weather_context = routing["weather_context"]
+    search_context = routing["search_context"]
+
+    if routing["weather_error"]:
+        st.warning(routing["weather_error"])
+    elif weather_context:
+        st.info(f"Fetched weather data for: {', '.join(routing['weather_cities'])}")
+
+    if routing["search_error"]:
+        st.warning(routing["search_error"])
+    elif search_context:
+        st.info(f"Loaded web search context from {routing['provider_used']} for: {routing['search_query']}")
+
     # Add text
     user_message_content.append({"type": "text", "text": prompt})
     
@@ -396,7 +782,13 @@ if prompt := st.chat_input("Message AI Assistant..."):
             file_context += f"\n{file_data['name']}: {file_data['content'][:500]}"    
     if file_context:
         user_message_content.append({"type": "text", "text": f"\n\nFiles: {file_context}"})
-    
+
+    if weather_context:
+        user_message_content.append({"type": "text", "text": f"\n\nLive weather context:\n{weather_context}"})
+
+    if search_context:
+        user_message_content.append({"type": "text", "text": f"\n\nWeb search context:\n{search_context}\n\nUse this context with citations when relevant."})
+
     current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
     
     with st.chat_message("user"):
@@ -404,7 +796,7 @@ if prompt := st.chat_input("Message AI Assistant..."):
     
     with st.chat_message("assistant"):
         try:
-            response = client.chat.completions.create(model=selected_model, messages=current_chat["messages"], temperature=temperature, stream=True)
+            response = stream_chat_completion(selected_model, current_chat["messages"], temperature)
             full_response = ""
             placeholder = st.empty()
             for chunk in response:
@@ -412,6 +804,14 @@ if prompt := st.chat_input("Message AI Assistant..."):
                     placeholder.markdown(full_response + "▌")
             placeholder.markdown(full_response)
             current_chat["messages"].append({"role": "assistant", "content": full_response})
+            pinecone_status = store_conversation_in_pinecone(
+                st.session_state.current_chat_id,
+                prompt,
+                full_response,
+            )
+            if not pinecone_status["success"]:
+                st.sidebar.warning(f"Pinecone store skipped: {pinecone_status['reason']}")
+                st.sidebar.caption(f"Pinecone status: {pinecone_status}")
         except Exception as e:
             st.error(f"Error: {str(e)}")
     st.rerun()
