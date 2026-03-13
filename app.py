@@ -3,14 +3,19 @@ Modern ChatGPT/Perplexity-style LLM Application with Multi-Chat & File Upload
 Built with OpenAI, Pinecone, and Advanced Document Processing
 """
 
+import os
+
 import streamlit as st
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 from openai  import OpenAI
-from pinecone import Pinecone
 from PIL import Image
 import base64
 from io import BytesIO
 from datetime import datetime
 import json
+import re
+import requests
 from pypdf import PdfReader
 from pptx import Presentation
 import docx
@@ -107,9 +112,13 @@ def load_config():
     try:
         return {
             "openai_api_key": st.secrets["OPENAI_API_KEY"],
-            "pinecone_api_key": st.secrets["PINECONE_API_KEY"],
+            "pinecone_api_key": st.secrets.get("PINECONE_API_KEY", ""),
             "pinecone_environment": st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter"),
-            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory")
+            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory"),
+            "langsmith_api_key": st.secrets.get("LANGSMITH_API_KEY", ""),
+            "langsmith_project": st.secrets.get("LANGSMITH_PROJECT", "llm-chatbot-streamlit"),
+            "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
+            "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", "")
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -119,20 +128,84 @@ config = load_config()
 if not config:
     st.stop()
 
+if config["langsmith_api_key"]:
+    os.environ["LANGSMITH_API_KEY"] = config["langsmith_api_key"]
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_PROJECT"] = config["langsmith_project"]
+    os.environ["LANGSMITH_ENDPOINT"] = config["langsmith_endpoint"]
 
-# Initialize Pinecone
-@st.cache_resource
-def init_pinecone():
-    client = OpenAI(api_key=config["openai_api_key"])
+client = wrap_openai(OpenAI(api_key=config["openai_api_key"]))
+
+@traceable(name="chat_completion_stream", run_type="llm")
+def stream_chat_completion(selected_model, messages, temperature):
+    return client.chat.completions.create(
+        model=selected_model,
+        messages=messages,
+        temperature=temperature,
+        stream=True
+    )
+
+
+
+
+
+def extract_weather_cities(prompt):
+    """Extract city names from weather-related prompts."""
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+
+    if prompt_lower.startswith('/weather '):
+        city_fragment = prompt_clean[len('/weather '):]
+    elif 'weather in ' in prompt_lower:
+        start = prompt_lower.find('weather in ') + len('weather in ')
+        city_fragment = prompt_clean[start:]
+    elif prompt_lower.startswith('weather '):
+        city_fragment = prompt_clean[len('weather '):]
+    else:
+        return []
+
+    city_fragment = re.split(r'[?.!\n]', city_fragment, maxsplit=1)[0]
+    city_fragment = city_fragment.strip()
+    if not city_fragment:
+        return []
+
+    city_fragment = re.sub(r'\b(today|now|currently|please)\b', '', city_fragment, flags=re.IGNORECASE).strip()
+    parts = re.split(r',|\band\b|&', city_fragment, flags=re.IGNORECASE)
+    return [part.strip(' .') for part in parts if part.strip(' .')]
+
+def load_weather_context(cities):
+    """Load weather context for the given cities using OpenWeatherMap."""
+    if not config["openweathermap_api_key"]:
+        return "", "OPENWEATHERMAP_API_KEY is not configured."
+
+    clean_cities = [city.strip() for city in cities if city and city.strip()]
+    if not clean_cities:
+        return "", "No valid city names provided."
+
     try:
-        pc = Pinecone(api_key=config["pinecone_api_key"])
-# Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
-    return pc.Index(config["pinecone_index_name"])
-    except Exception as e:
-        st.sidebar.error(f"Pinecone Error: {str(e)}")
-        return None
+        weather_reports = []
+        for city in clean_cities:
+            response = requests.get(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={
+                    "q": city,
+                    "appid": config["openweathermap_api_key"],
+                    "units": "metric",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-pinecone_index = init_pinecone()
+            weather_reports.append(
+                f"{data['name']}: {data['weather'][0]['description']}, "
+                f"temperature {data['main']['temp']}°C, feels like {data['main']['feels_like']}°C, "
+                f"humidity {data['main']['humidity']}%, wind {data['wind']['speed']} m/s"
+            )
+
+        return "\n".join(weather_reports), ""
+    except requests.RequestException as exc:
+        return "", f"Weather lookup failed: {exc}"
 
 # Helper functions for file processing
 def encode_image_to_base64(image):
@@ -373,10 +446,19 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Message AI Assistant..."):
+if prompt := st.chat_input("Ask anything... (weather in city / /weather city1, city2)"):
     # Prepare user message content
     user_message_content = []
-    
+
+    weather_context = ""
+    city_list = extract_weather_cities(prompt)
+    if city_list:
+        weather_context, weather_error = load_weather_context(city_list)
+        if weather_error:
+            st.warning(weather_error)
+        elif weather_context:
+            st.info(f"Fetched weather data for: {', '.join(city_list)}")
+
     # Add text
     user_message_content.append({"type": "text", "text": prompt})
     
@@ -396,7 +478,10 @@ if prompt := st.chat_input("Message AI Assistant..."):
             file_context += f"\n{file_data['name']}: {file_data['content'][:500]}"    
     if file_context:
         user_message_content.append({"type": "text", "text": f"\n\nFiles: {file_context}"})
-    
+
+    if weather_context:
+        user_message_content.append({"type": "text", "text": f"\n\nLive weather context:\n{weather_context}"})
+
     current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
     
     with st.chat_message("user"):
@@ -404,7 +489,7 @@ if prompt := st.chat_input("Message AI Assistant..."):
     
     with st.chat_message("assistant"):
         try:
-            response = client.chat.completions.create(model=selected_model, messages=current_chat["messages"], temperature=temperature, stream=True)
+            response = stream_chat_completion(selected_model, current_chat["messages"], temperature)
             full_response = ""
             placeholder = st.empty()
             for chunk in response:
