@@ -13,6 +13,7 @@ from PIL import Image
 import base64
 from io import BytesIO
 from datetime import datetime
+import uuid
 import json
 import re
 import requests
@@ -369,6 +370,58 @@ def route_tools(prompt, provider):
 
     return routing
 
+@st.cache_resource
+def get_pinecone_index():
+    """Initialize and cache Pinecone index for conversation storage."""
+    if not config["pinecone_api_key"]:
+        return None
+
+    try:
+        from pinecone import Pinecone
+
+        pc = Pinecone(api_key=config["pinecone_api_key"])
+        existing_indexes = [idx.name for idx in pc.list_indexes()]
+
+        if config["pinecone_index_name"] not in existing_indexes:
+            return None
+
+        return pc.Index(config["pinecone_index_name"])
+    except Exception as exc:
+        st.sidebar.warning(f"Pinecone storage disabled: {exc}")
+        return None
+
+
+@traceable(name="store_conversation_pinecone", run_type="tool")
+def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
+    """Store a single user/assistant turn in Pinecone."""
+    index = get_pinecone_index()
+    if index is None:
+        return False
+
+    text_payload = f"User: {user_message}\nAssistant: {assistant_message}"
+
+    try:
+        embedding = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text_payload,
+        ).data[0].embedding
+
+        vector_id = f"{chat_id}-{uuid.uuid4()}"
+        metadata = {
+            "chat_id": chat_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "user_message": user_message[:2000],
+            "assistant_message": assistant_message[:2000],
+            "source": "streamlit_chat",
+        }
+
+        index.upsert(vectors=[{"id": vector_id, "values": embedding, "metadata": metadata}])
+        return True
+    except Exception as exc:
+        st.warning(f"Unable to persist conversation to Pinecone: {exc}")
+        return False
+
+
 # Helper functions for file processing
 def encode_image_to_base64(image):
     """Convert PIL Image to base64 string."""
@@ -673,6 +726,11 @@ if prompt := st.chat_input("Ask anything... (tools auto-route for weather/live w
                     placeholder.markdown(full_response + "▌")
             placeholder.markdown(full_response)
             current_chat["messages"].append({"role": "assistant", "content": full_response})
+            store_conversation_in_pinecone(
+                st.session_state.current_chat_id,
+                prompt,
+                full_response,
+            )
         except Exception as e:
             st.error(f"Error: {str(e)}")
     st.rerun()

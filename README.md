@@ -56,3 +56,10 @@ The app now uses a lightweight tool router before each LLM call:
 4. Send enriched context to the LLM for final response.
 
 This routing is traced in LangSmith with dedicated runs (`tool_router`, `weather_context`, `web_search_context`, `search_tavily`, `search_serpapi`).
+
+
+## Pinecone conversation storage
+
+Each completed chat turn (user + assistant) is persisted to Pinecone when `PINECONE_API_KEY` and an existing `PINECONE_INDEX_NAME` are configured.
+
+Stored metadata includes: `chat_id`, `timestamp`, `user_message`, `assistant_message`, and `source`.
