@@ -127,7 +127,7 @@ def init_pinecone():
     try:
         pc = Pinecone(api_key=config["pinecone_api_key"])
 # Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
-            return pc.Index(config["pinecone_index_name"]
+            return pc.Index(config["pinecone_index_name"])
     except Exception as e:
         st.sidebar.error(f"Pinecone Error: {str(e)}")
         return None
