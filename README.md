@@ -84,24 +84,16 @@ If LangSmith still shows `output: false` or `success: false` for `store_conversa
 
 Note: Pinecone upserts use the default namespace (no explicit namespace field) for compatibility with serverless index APIs.
 
-
 ## ICT Concept RAG
 
-Enable **Include ICT Concept Technology (RAG)** in the sidebar to inject retrieval context from your ICT Pinecone index before answer generation.
+Enable **Include ICT Concept Technology (RAG)** in the sidebar to use a simple RAG flow against your ICT Pinecone index.
 
-Sidebar options:
-- **Retrieval Technique**: `Hybrid` (default), `Dense`, `Sparse`
-- **Reranker**: `Cohere Rerank` (default), `BGE reranker`, `ColBERT`
-- **Query Strategy**: `HyDE` (default), `Query Expansion`, `Query Decomposition`
-- **RAG Top-K**: number of retrieved chunks
+Flow:
+1. Embed user query with `text-embedding-3-small`
+2. Retrieve top ICT chunks from Pinecone
+3. Build context from retrieved chunks
+4. Inject context into the prompt before final LLM answer
 
-Optional/additional secrets:
-- `ICT_PINECONE_INDEX_NAME` (defaults to `PINECONE_INDEX_NAME`)
-- `COHERE_API_KEY` (used only when `Cohere Rerank` is selected)
-
-Pipeline flow:
-1. Query transformation (HyDE / Expansion / Decomposition)
-2. Pinecone retrieval (dense / sparse / hybrid)
-3. Reranking (Cohere/BGE/ColBERT)
-4. Context injection into the user message
-5. Final LLM answer with sources
+Required secrets:
+- `PINECONE_API_KEY`
+- `PINECONE_INDEX_NAME` (your ICT index)

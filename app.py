@@ -122,9 +122,7 @@ def load_config():
             "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
             "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", ""),
             "serpapi_api_key": st.secrets.get("SERPAPI_API_KEY", ""),
-            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", ""),
-            "cohere_api_key": st.secrets.get("COHERE_API_KEY", ""),
-            "ict_pinecone_index_name": st.secrets.get("ICT_PINECONE_INDEX_NAME", st.secrets.get("PINECONE_INDEX_NAME", "ict-memory"))
+            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", "")
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -374,104 +372,77 @@ def route_tools(prompt, provider):
     return routing
 
 
-@traceable(name="ict_rag_pipeline", run_type="chain")
-def run_ict_rag_pipeline(query, retrieval_mode, reranker, query_strategy, top_k, llm_model):
-    """End-to-end ICT RAG pipeline (query transform -> retrieve -> rerank -> context)."""
-    host, index_dimension, resolve_error = resolve_index(
-        config["ict_pinecone_index_name"],
-        config["pinecone_api_key"],
-    )
-    if resolve_error:
-        return {"context": "", "sources": [], "error": resolve_error}
+@traceable(name="ict_retrieve_chunks", run_type="tool")
+def retrieve_ict_chunks(query, top_k=8):
+    """Simple dense retrieval from Pinecone ICT index via REST."""
+    if not config["pinecone_api_key"]:
+        return [], "PINECONE_API_KEY is not configured."
 
-    query_variants = transform_query(client, query, query_strategy, llm_model)
-    all_docs = []
-    seen_ids = set()
+    index_name = config["pinecone_index_name"]
+    headers = {"Api-Key": config["pinecone_api_key"], "Accept": "application/json"}
 
-    for q in query_variants:
-        dense_vector = None
-        sparse_vector = None
-
-        if retrieval_mode in {"Dense", "Hybrid"}:
-            embed_params = {"model": "text-embedding-3-small", "input": q}
-            if index_dimension and int(index_dimension) <= 1536:
-                embed_params["dimensions"] = int(index_dimension)
-            dense_vector = client.embeddings.create(**embed_params).data[0].embedding
-
-        if retrieval_mode in {"Sparse", "Hybrid"}:
-            sparse_vector = build_sparse_vector(q)
-
-        matches, query_error = run_pinecone_query(
-            host=host,
-            api_key=config["pinecone_api_key"],
-            top_k=top_k,
-            dense_vector=dense_vector,
-            sparse_vector=sparse_vector,
+    try:
+        idx_resp = requests.get(
+            f"https://api.pinecone.io/indexes/{index_name}",
+            headers=headers,
+            timeout=15,
         )
+        if idx_resp.status_code == 404:
+            return [], f"Pinecone index '{index_name}' does not exist."
+        idx_resp.raise_for_status()
+        idx_data = idx_resp.json()
+        host = idx_data.get("host") or idx_data.get("status", {}).get("host")
+        dimension = idx_data.get("dimension") or idx_data.get("spec", {}).get("dimension")
+        if not host:
+            return [], "Pinecone index host could not be resolved."
 
-        if query_error and retrieval_mode == "Hybrid" and dense_vector is not None:
-            matches, query_error = run_pinecone_query(
-                host=host,
-                api_key=config["pinecone_api_key"],
-                top_k=top_k,
-                dense_vector=dense_vector,
-                sparse_vector=None,
-            )
+        emb_params = {"model": "text-embedding-3-small", "input": [query], "encoding_format": "float"}
+        if dimension and int(dimension) <= 1536:
+            emb_params["dimensions"] = int(dimension)
+        q_emb = client.embeddings.create(**emb_params).data[0].embedding
 
-        if query_error:
-            return {"context": "", "sources": [], "error": query_error}
+        query_resp = requests.post(
+            f"https://{host}/query",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "vector": q_emb,
+                "topK": top_k,
+                "includeMetadata": True,
+            },
+            timeout=20,
+        )
+        if query_resp.status_code >= 400:
+            return [], f"Pinecone query failed HTTP {query_resp.status_code}: {query_resp.text[:800]}"
 
+        matches = query_resp.json().get("matches", [])
+        docs = []
         for m in matches:
-            doc_id = m.get("id")
-            if not doc_id or doc_id in seen_ids:
-                continue
-            seen_ids.add(doc_id)
             meta = m.get("metadata", {}) or {}
-            all_docs.append(
-                {
-                    "id": doc_id,
-                    "score": m.get("score", 0),
-                    "source": meta.get("source", "unknown"),
-                    "chunk_id": meta.get("chunk_id", ""),
-                    "text": meta.get("text") or meta.get("assistant_message") or "",
-                }
-            )
+            docs.append({
+                "source": meta.get("source", "unknown"),
+                "chunk_id": meta.get("chunk_id", ""),
+                "text": meta.get("text", ""),
+                "score": m.get("score", 0),
+            })
+        return docs, ""
+    except requests.RequestException as exc:
+        return [], f"ICT retrieval failed: {exc}"
 
-    if not all_docs:
-        return {"context": "", "sources": [], "error": "No ICT context found for this query."}
 
-    reranked = rerank_documents(
-        client=client,
-        query=query,
-        docs=all_docs,
-        reranker=reranker,
-        cohere_api_key=config.get("cohere_api_key", ""),
-        embedding_model="text-embedding-3-small",
-    )
-    top_docs = reranked[:top_k]
+def build_ict_rag_context(query, top_k=8):
+    """Build simple RAG context string from ICT chunks."""
+    docs, err = retrieve_ict_chunks(query, top_k=top_k)
+    if err:
+        return "", [], err
 
-    context_parts = []
-    sources = []
-    for idx, doc in enumerate(top_docs, start=1):
-        context_parts.append(
-            f"[{idx}] source={doc['source']} chunk_id={doc['chunk_id']} score={doc.get('score', 0):.4f} rerank={doc.get('rerank_score', 0):.4f}\n{doc['text'][:1400]}"
-        )
-        sources.append(
-            {
-                "id": doc["id"],
-                "source": doc["source"],
-                "chunk_id": doc["chunk_id"],
-                "score": doc.get("score", 0),
-                "rerank_score": doc.get("rerank_score", 0),
-            }
+    parts = []
+    for i, d in enumerate(docs, start=1):
+        parts.append(
+            f"### Chunk {i} (source: {d['source']}, chunk_id: {d['chunk_id']}, score: {d['score']:.3f})\n"
+            f"{d['text'][:1200]}"
         )
 
-    return {
-        "context": "\n\n".join(context_parts),
-        "sources": sources,
-        "error": "",
-        "query_variants": query_variants,
-    }
+    return "\n\n".join(parts), docs, ""
 
 
 def get_pinecone_index():
@@ -800,23 +771,6 @@ with st.sidebar:
 
     st.markdown("### 📚 ICT Concept RAG")
     use_ict_rag = st.checkbox("Include ICT Concept Technology (RAG)", value=False)
-    rag_retrieval_mode = st.selectbox(
-        "Retrieval Technique",
-        ["Hybrid", "Dense", "Sparse"],
-        index=0,
-        help="Hybrid uses both dense and sparse retrieval signals."
-    )
-    rag_reranker = st.selectbox(
-        "Reranker",
-        ["Cohere Rerank", "BGE reranker", "ColBERT"],
-        index=0,
-    )
-    rag_query_strategy = st.selectbox(
-        "Query Strategy",
-        ["HyDE", "Query Expansion", "Query Decomposition"],
-        index=0,
-    )
-    rag_top_k = st.slider("RAG Top-K", 3, 20, 8)
 
     st.markdown("---")
     st.markdown("### 📊 Stats")
@@ -889,27 +843,15 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
 
     ict_context = ""
     if use_ict_rag:
-        rag_result = run_ict_rag_pipeline(
-            query=prompt,
-            retrieval_mode=rag_retrieval_mode,
-            reranker=rag_reranker,
-            query_strategy=rag_query_strategy,
-            top_k=rag_top_k,
-            llm_model=selected_model,
-        )
-        if rag_result.get("error"):
-            st.warning(f"ICT RAG skipped: {rag_result['error']}")
+        ict_context, ict_sources, ict_error = build_ict_rag_context(prompt, top_k=8)
+        if ict_error:
+            st.warning(f"ICT RAG skipped: {ict_error}")
         else:
-            ict_context = rag_result.get("context", "")
-            st.info(
-                f"ICT RAG loaded ({rag_retrieval_mode} + {rag_reranker} + {rag_query_strategy}) "
-                f"with {len(rag_result.get('sources', []))} chunks."
-            )
+            st.info(f"ICT RAG loaded with {len(ict_sources)} chunks.")
             with st.expander("📚 ICT RAG Sources", expanded=False):
-                for src in rag_result.get("sources", []):
+                for src in ict_sources:
                     st.markdown(
-                        f"- `{src['source']}` | chunk `{src['chunk_id']}` | "
-                        f"score `{src['score']:.4f}` | rerank `{src['rerank_score']:.4f}`"
+                        f"- `{src['source']}` | chunk `{src['chunk_id']}` | score `{src['score']:.4f}`"
                     )
 
     # Add text
