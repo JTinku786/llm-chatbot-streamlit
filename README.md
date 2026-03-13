@@ -23,4 +23,4 @@ Add this secret to Streamlit Cloud:
 
 - `OPENWEATHERMAP_API_KEY`
 
-This key is used by `WeatherDataLoader` from `langchain_community` to fetch current weather context and include it in the prompt.
+This key is used to call the OpenWeatherMap current weather API and include live weather context in the prompt.

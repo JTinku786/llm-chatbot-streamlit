@@ -8,13 +8,13 @@ import os
 import streamlit as st
 from langsmith import traceable
 from langsmith.wrappers import wrap_openai
-from langchain_community.document_loaders import WeatherDataLoader
 from openai  import OpenAI
 from PIL import Image
 import base64
 from io import BytesIO
 from datetime import datetime
 import json
+import requests
 from pypdf import PdfReader
 from pptx import Presentation
 import docx
@@ -156,14 +156,28 @@ def load_weather_context(cities):
         return "", "No valid city names provided."
 
     try:
-        loader = WeatherDataLoader.from_params(
-            clean_cities,
-            openweathermap_api_key=config["openweathermap_api_key"]
-        )
-        documents = loader.load()
-        context = "\n\n".join(doc.page_content for doc in documents if doc.page_content)
-        return context, ""
-    except Exception as exc:
+        weather_reports = []
+        for city in clean_cities:
+            response = requests.get(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={
+                    "q": city,
+                    "appid": config["openweathermap_api_key"],
+                    "units": "metric",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            weather_reports.append(
+                f"{data['name']}: {data['weather'][0]['description']}, "
+                f"temperature {data['main']['temp']}°C, feels like {data['main']['feels_like']}°C, "
+                f"humidity {data['main']['humidity']}%, wind {data['wind']['speed']} m/s"
+            )
+
+        return "\n".join(weather_reports), ""
+    except requests.RequestException as exc:
         return "", f"Weather lookup failed: {exc}"
 
 # Helper functions for file processing
