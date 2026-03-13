@@ -5,7 +5,6 @@ Built with OpenAI, Pinecone, and Advanced Document Processing
 
 import streamlit as st
 from openai  import OpenAI
-from pinecone import Pinecone
 from PIL import Image
 import base64
 from io import BytesIO
@@ -107,7 +106,7 @@ def load_config():
     try:
         return {
             "openai_api_key": st.secrets["OPENAI_API_KEY"],
-            "pinecone_api_key": st.secrets["PINECONE_API_KEY"],
+            "pinecone_api_key": st.secrets.get("PINECONE_API_KEY", ""),
             "pinecone_environment": st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter"),
             "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory")
         }
@@ -122,18 +121,6 @@ if not config:
 client = OpenAI(api_key=config["openai_api_key"])
 
 
-# Initialize Pinecone
-@st.cache_resource
-def init_pinecone():
-    try:
-        pc = Pinecone(api_key=config["pinecone_api_key"])
-        # Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
-        return pc.Index(config["pinecone_index_name"])
-    except Exception as e:
-        st.sidebar.error(f"Pinecone Error: {str(e)}")
-        return None
-
-pinecone_index = init_pinecone()
 
 # Helper functions for file processing
 def encode_image_to_base64(image):
