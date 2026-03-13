@@ -3,9 +3,12 @@ Modern ChatGPT/Perplexity-style LLM Application with Multi-Chat & File Upload
 Built with OpenAI, Pinecone, and Advanced Document Processing
 """
 
+import os
+
 import streamlit as st
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 from openai  import OpenAI
-from pinecone import Pinecone
 from PIL import Image
 import base64
 from io import BytesIO
@@ -107,9 +110,12 @@ def load_config():
     try:
         return {
             "openai_api_key": st.secrets["OPENAI_API_KEY"],
-            "pinecone_api_key": st.secrets["PINECONE_API_KEY"],
+            "pinecone_api_key": st.secrets.get("PINECONE_API_KEY", ""),
             "pinecone_environment": st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter"),
-            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory")
+            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory"),
+            "langsmith_api_key": st.secrets.get("LANGSMITH_API_KEY", ""),
+            "langsmith_project": st.secrets.get("LANGSMITH_PROJECT", "llm-chatbot-streamlit"),
+            "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -119,20 +125,22 @@ config = load_config()
 if not config:
     st.stop()
 
+if config["langsmith_api_key"]:
+    os.environ["LANGSMITH_API_KEY"] = config["langsmith_api_key"]
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_PROJECT"] = config["langsmith_project"]
+    os.environ["LANGSMITH_ENDPOINT"] = config["langsmith_endpoint"]
 
-# Initialize Pinecone
-@st.cache_resource
-def init_pinecone():
-    client = OpenAI(api_key=config["openai_api_key"])
-    try:
-        pc = Pinecone(api_key=config["pinecone_api_key"])
-# Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
-    return pc.Index(config["pinecone_index_name"])
-    except Exception as e:
-        st.sidebar.error(f"Pinecone Error: {str(e)}")
-        return None
+client = wrap_openai(OpenAI(api_key=config["openai_api_key"]))
 
-pinecone_index = init_pinecone()
+@traceable(name="chat_completion_stream", run_type="llm")
+def stream_chat_completion(selected_model, messages, temperature):
+    return client.chat.completions.create(
+        model=selected_model,
+        messages=messages,
+        temperature=temperature,
+        stream=True
+    )
 
 # Helper functions for file processing
 def encode_image_to_base64(image):
@@ -404,7 +412,7 @@ if prompt := st.chat_input("Message AI Assistant..."):
     
     with st.chat_message("assistant"):
         try:
-            response = client.chat.completions.create(model=selected_model, messages=current_chat["messages"], temperature=temperature, stream=True)
+            response = stream_chat_completion(selected_model, current_chat["messages"], temperature)
             full_response = ""
             placeholder = st.empty()
             for chunk in response:
