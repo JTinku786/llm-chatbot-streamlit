@@ -3,14 +3,19 @@ Modern ChatGPT/Perplexity-style LLM Application with Multi-Chat & File Upload
 Built with OpenAI, Pinecone, and Advanced Document Processing
 """
 
+import os
+
 import streamlit as st
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 from openai  import OpenAI
-from pinecone import Pinecone
 from PIL import Image
 import base64
 from io import BytesIO
 from datetime import datetime
 import json
+import re
+import requests
 from pypdf import PdfReader
 from pptx import Presentation
 import docx
@@ -107,9 +112,15 @@ def load_config():
     try:
         return {
             "openai_api_key": st.secrets["OPENAI_API_KEY"],
-            "pinecone_api_key": st.secrets["PINECONE_API_KEY"],
+            "pinecone_api_key": st.secrets.get("PINECONE_API_KEY", ""),
             "pinecone_environment": st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter"),
-            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory")
+            "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory"),
+            "langsmith_api_key": st.secrets.get("LANGSMITH_API_KEY", ""),
+            "langsmith_project": st.secrets.get("LANGSMITH_PROJECT", "llm-chatbot-streamlit"),
+            "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
+            "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", ""),
+            "serpapi_api_key": st.secrets.get("SERPAPI_API_KEY", ""),
+            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", "")
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -119,20 +130,195 @@ config = load_config()
 if not config:
     st.stop()
 
+if config["langsmith_api_key"]:
+    os.environ["LANGSMITH_API_KEY"] = config["langsmith_api_key"]
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_PROJECT"] = config["langsmith_project"]
+    os.environ["LANGSMITH_ENDPOINT"] = config["langsmith_endpoint"]
 
-# Initialize Pinecone
-@st.cache_resource
-def init_pinecone():
-    client = OpenAI(api_key=config["openai_api_key"])
+client = wrap_openai(OpenAI(api_key=config["openai_api_key"]))
+
+@traceable(name="chat_completion_stream", run_type="llm")
+def stream_chat_completion(selected_model, messages, temperature):
+    return client.chat.completions.create(
+        model=selected_model,
+        messages=messages,
+        temperature=temperature,
+        stream=True
+    )
+
+
+
+
+
+
+
+def extract_search_query(prompt):
+    """Extract web-search query from user prompt."""
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+
+    if prompt_lower.startswith('/search '):
+        return prompt_clean[len('/search '):].strip()
+    if prompt_lower.startswith('search '):
+        return prompt_clean[len('search '):].strip()
+    if prompt_lower.startswith('google '):
+        return prompt_clean[len('google '):].strip()
+    if prompt_lower.startswith('look up '):
+        return prompt_clean[len('look up '):].strip()
+
+    return ''
+
+
+def search_with_serpapi(query, max_results=5):
+    """Fetch search results from SerpAPI."""
+    if not config["serpapi_api_key"]:
+        return [], "SERPAPI_API_KEY is not configured."
+
     try:
-        pc = Pinecone(api_key=config["pinecone_api_key"])
-# Just connect to existing index - Pinecone v3 doesn't require ServerlessSpec
-    return pc.Index(config["pinecone_index_name"])
-    except Exception as e:
-        st.sidebar.error(f"Pinecone Error: {str(e)}")
-        return None
+        response = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "q": query,
+                "api_key": config["serpapi_api_key"],
+                "num": max_results,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("organic_results", [])[:max_results]
+        results = [
+            {
+                "title": item.get("title", "Untitled"),
+                "snippet": item.get("snippet", ""),
+                "url": item.get("link", ""),
+            }
+            for item in items
+        ]
+        return results, ""
+    except requests.RequestException as exc:
+        return [], f"SerpAPI search failed: {exc}"
 
-pinecone_index = init_pinecone()
+
+def search_with_tavily(query, max_results=5):
+    """Fetch search results from Tavily."""
+    if not config["tavily_api_key"]:
+        return [], "TAVILY_API_KEY is not configured."
+
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": config["tavily_api_key"],
+                "query": query,
+                "max_results": max_results,
+                "include_answer": True,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("results", [])[:max_results]
+        results = [
+            {
+                "title": item.get("title", "Untitled"),
+                "snippet": item.get("content", ""),
+                "url": item.get("url", ""),
+            }
+            for item in items
+        ]
+        if data.get("answer"):
+            results.insert(0, {"title": "Tavily Answer", "snippet": data["answer"], "url": ""})
+        return results[:max_results], ""
+    except requests.RequestException as exc:
+        return [], f"Tavily search failed: {exc}"
+
+
+def load_web_search_context(query, provider):
+    """Load web search context from selected provider."""
+    provider_order = {
+        "Auto": ["Tavily", "SerpAPI"],
+        "Tavily": ["Tavily"],
+        "SerpAPI": ["SerpAPI"],
+    }
+
+    provider_map = {
+        "Tavily": search_with_tavily,
+        "SerpAPI": search_with_serpapi,
+    }
+
+    errors = []
+    for provider_name in provider_order.get(provider, [provider]):
+        results, error = provider_map[provider_name](query)
+        if results:
+            lines = [
+                f"[{idx}] {item['title']}\n{item['snippet']}\n{item['url']}"
+                for idx, item in enumerate(results, start=1)
+            ]
+            return "\n\n".join(lines), provider_name, ""
+        if error:
+            errors.append(f"{provider_name}: {error}")
+
+    return "", "", " | ".join(errors) if errors else "No search results found."
+
+def extract_weather_cities(prompt):
+    """Extract city names from weather-related prompts."""
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+
+    if prompt_lower.startswith('/weather '):
+        city_fragment = prompt_clean[len('/weather '):]
+    elif 'weather in ' in prompt_lower:
+        start = prompt_lower.find('weather in ') + len('weather in ')
+        city_fragment = prompt_clean[start:]
+    elif prompt_lower.startswith('weather '):
+        city_fragment = prompt_clean[len('weather '):]
+    else:
+        return []
+
+    city_fragment = re.split(r'[?.!\n]', city_fragment, maxsplit=1)[0]
+    city_fragment = city_fragment.strip()
+    if not city_fragment:
+        return []
+
+    city_fragment = re.sub(r'\b(today|now|currently|please)\b', '', city_fragment, flags=re.IGNORECASE).strip()
+    parts = re.split(r',|\band\b|&', city_fragment, flags=re.IGNORECASE)
+    return [part.strip(' .') for part in parts if part.strip(' .')]
+
+def load_weather_context(cities):
+    """Load weather context for the given cities using OpenWeatherMap."""
+    if not config["openweathermap_api_key"]:
+        return "", "OPENWEATHERMAP_API_KEY is not configured."
+
+    clean_cities = [city.strip() for city in cities if city and city.strip()]
+    if not clean_cities:
+        return "", "No valid city names provided."
+
+    try:
+        weather_reports = []
+        for city in clean_cities:
+            response = requests.get(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={
+                    "q": city,
+                    "appid": config["openweathermap_api_key"],
+                    "units": "metric",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            weather_reports.append(
+                f"{data['name']}: {data['weather'][0]['description']}, "
+                f"temperature {data['main']['temp']}°C, feels like {data['main']['feels_like']}°C, "
+                f"humidity {data['main']['humidity']}%, wind {data['wind']['speed']} m/s"
+            )
+
+        return "\n".join(weather_reports), ""
+    except requests.RequestException as exc:
+        return "", f"Weather lookup failed: {exc}"
 
 # Helper functions for file processing
 def encode_image_to_base64(image):
@@ -321,6 +507,12 @@ with st.sidebar:
     
     temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
     use_rag = st.toggle("Use Memory (RAG)", value=True)
+    web_search_provider = st.selectbox(
+        "Web Search Provider",
+        ["Auto", "Tavily", "SerpAPI"],
+        index=0,
+        help="Used when you ask with /search, search, google, or look up."
+    )
     
     st.markdown("---")
     st.markdown("### 📊 Stats")
@@ -373,10 +565,28 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Message AI Assistant..."):
+if prompt := st.chat_input("Ask anything... (weather in city, /weather, /search)"):
     # Prepare user message content
     user_message_content = []
-    
+
+    weather_context = ""
+    city_list = extract_weather_cities(prompt)
+    if city_list:
+        weather_context, weather_error = load_weather_context(city_list)
+        if weather_error:
+            st.warning(weather_error)
+        elif weather_context:
+            st.info(f"Fetched weather data for: {', '.join(city_list)}")
+
+    search_context = ""
+    search_query = extract_search_query(prompt)
+    if search_query:
+        search_context, provider_used, search_error = load_web_search_context(search_query, web_search_provider)
+        if search_error:
+            st.warning(search_error)
+        elif search_context:
+            st.info(f"Loaded web search context from {provider_used} for: {search_query}")
+
     # Add text
     user_message_content.append({"type": "text", "text": prompt})
     
@@ -396,7 +606,13 @@ if prompt := st.chat_input("Message AI Assistant..."):
             file_context += f"\n{file_data['name']}: {file_data['content'][:500]}"    
     if file_context:
         user_message_content.append({"type": "text", "text": f"\n\nFiles: {file_context}"})
-    
+
+    if weather_context:
+        user_message_content.append({"type": "text", "text": f"\n\nLive weather context:\n{weather_context}"})
+
+    if search_context:
+        user_message_content.append({"type": "text", "text": f"\n\nWeb search context:\n{search_context}\n\nUse this context with citations when relevant."})
+
     current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
     
     with st.chat_message("user"):
@@ -404,7 +620,7 @@ if prompt := st.chat_input("Message AI Assistant..."):
     
     with st.chat_message("assistant"):
         try:
-            response = client.chat.completions.create(model=selected_model, messages=current_chat["messages"], temperature=temperature, stream=True)
+            response = stream_chat_completion(selected_model, current_chat["messages"], temperature)
             full_response = ""
             placeholder = st.empty()
             for chunk in response:
