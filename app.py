@@ -370,14 +370,24 @@ def route_tools(prompt, provider):
 
     return routing
 
-@st.cache_resource
 def get_pinecone_index():
     """Initialize and cache Pinecone index for conversation storage."""
     if not config["pinecone_api_key"]:
         return None, "PINECONE_API_KEY is not configured."
 
     try:
-        from pinecone import Pinecone
+        try:
+            from pinecone import Pinecone
+        except Exception as primary_import_error:
+            try:
+                from pinecone.grpc import PineconeGRPC as Pinecone
+            except Exception as grpc_import_error:
+                return (
+                    None,
+                    "Pinecone import failed. "
+                    f"Standard import error: {primary_import_error}. "
+                    f"gRPC fallback import error: {grpc_import_error}",
+                )
 
         pc = Pinecone(api_key=config["pinecone_api_key"])
         existing_indexes = [idx.name for idx in pc.list_indexes()]
@@ -395,7 +405,7 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
     """Store a single user/assistant turn in Pinecone."""
     index, init_error = get_pinecone_index()
     if index is None:
-        return {"success": False, "reason": init_error, "vector_id": ""}
+        return {"success": False, "reason": init_error, "vector_id": "", "error_type": "init_error"}
 
     text_payload = f"User: {user_message}\nAssistant: {assistant_message}"
 
@@ -415,9 +425,14 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
         }
 
         index.upsert(vectors=[{"id": vector_id, "values": embedding, "metadata": metadata}])
-        return {"success": True, "reason": "", "vector_id": vector_id}
+        return {"success": True, "reason": "", "vector_id": vector_id, "error_type": ""}
     except Exception as exc:
-        return {"success": False, "reason": f"Pinecone upsert failed: {exc}", "vector_id": ""}
+        return {
+            "success": False,
+            "reason": f"Pinecone upsert failed: {exc}",
+            "vector_id": "",
+            "error_type": type(exc).__name__,
+        }
 
 
 # Helper functions for file processing
@@ -731,6 +746,7 @@ if prompt := st.chat_input("Ask anything... (tools auto-route for weather/live w
             )
             if not pinecone_status["success"]:
                 st.sidebar.warning(f"Pinecone store skipped: {pinecone_status['reason']}")
+                st.sidebar.caption(f"Pinecone status: {pinecone_status}")
         except Exception as e:
             st.error(f"Error: {str(e)}")
     st.rerun()
