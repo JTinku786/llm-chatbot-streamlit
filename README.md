@@ -63,3 +63,19 @@ This routing is traced in LangSmith with dedicated runs (`tool_router`, `weather
 Each completed chat turn (user + assistant) is persisted to Pinecone when `PINECONE_API_KEY` and an existing `PINECONE_INDEX_NAME` are configured.
 
 Stored metadata includes: `chat_id`, `timestamp`, `user_message`, `assistant_message`, and `source`.
+
+If persistence is skipped, the LangSmith `store_conversation_pinecone` run now returns a reason (for example missing API key, missing index, or upsert failure).
+
+
+If `store_conversation_pinecone` fails, check the `reason` in LangSmith output and sidebar. This now includes detailed init/import/upsert errors (including Pinecone import/plugin issues).
+
+
+### Troubleshooting Pinecone writes
+
+If LangSmith still shows `output: false` or `success: false` for `store_conversation_pinecone`:
+
+1. Ensure the deployed app is on the latest commit (older builds returned only `false`).
+2. Verify `PINECONE_API_KEY` and `PINECONE_INDEX_NAME` are set exactly in Streamlit secrets.
+3. Ensure the index exists and is reachable with the same API key/project.
+4. Check `reason` and `error_type` fields in the run output/sidebar for exact failure cause.
+5. If using a custom index dimension, the app now adapts embedding dimensions up to 1536 for `text-embedding-3-small`.
