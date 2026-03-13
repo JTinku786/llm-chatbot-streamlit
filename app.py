@@ -8,6 +8,7 @@ import os
 import streamlit as st
 from langsmith import traceable
 from langsmith.wrappers import wrap_openai
+from langchain_community.document_loaders import WeatherDataLoader
 from openai  import OpenAI
 from PIL import Image
 import base64
@@ -115,7 +116,8 @@ def load_config():
             "pinecone_index_name": st.secrets.get("PINECONE_INDEX_NAME", "chatbot-memory"),
             "langsmith_api_key": st.secrets.get("LANGSMITH_API_KEY", ""),
             "langsmith_project": st.secrets.get("LANGSMITH_PROJECT", "llm-chatbot-streamlit"),
-            "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+            "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
+            "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", "")
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -141,6 +143,28 @@ def stream_chat_completion(selected_model, messages, temperature):
         temperature=temperature,
         stream=True
     )
+
+
+
+def load_weather_context(cities):
+    """Load weather context for the given cities using OpenWeatherMap."""
+    if not config["openweathermap_api_key"]:
+        return "", "OPENWEATHERMAP_API_KEY is not configured."
+
+    clean_cities = [city.strip() for city in cities if city and city.strip()]
+    if not clean_cities:
+        return "", "No valid city names provided."
+
+    try:
+        loader = WeatherDataLoader.from_params(
+            clean_cities,
+            openweathermap_api_key=config["openweathermap_api_key"]
+        )
+        documents = loader.load()
+        context = "\n\n".join(doc.page_content for doc in documents if doc.page_content)
+        return context, ""
+    except Exception as exc:
+        return "", f"Weather lookup failed: {exc}"
 
 # Helper functions for file processing
 def encode_image_to_base64(image):
@@ -381,10 +405,20 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Message AI Assistant..."):
+if prompt := st.chat_input("Message AI Assistant... (use /weather city1, city2)"):
     # Prepare user message content
     user_message_content = []
-    
+
+    weather_context = ""
+    if prompt.lower().startswith("/weather "):
+        city_input = prompt[len("/weather "):].strip()
+        city_list = [city.strip() for city in city_input.split(",")]
+        weather_context, weather_error = load_weather_context(city_list)
+        if weather_error:
+            st.warning(weather_error)
+        elif weather_context:
+            st.info(f"Fetched weather data for: {', '.join(city_list)}")
+
     # Add text
     user_message_content.append({"type": "text", "text": prompt})
     
@@ -404,7 +438,10 @@ if prompt := st.chat_input("Message AI Assistant..."):
             file_context += f"\n{file_data['name']}: {file_data['content'][:500]}"    
     if file_context:
         user_message_content.append({"type": "text", "text": f"\n\nFiles: {file_context}"})
-    
+
+    if weather_context:
+        user_message_content.append({"type": "text", "text": f"\n\nLive weather context:\n{weather_context}"})
+
     current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
     
     with st.chat_message("user"):
