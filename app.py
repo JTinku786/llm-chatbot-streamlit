@@ -371,56 +371,54 @@ def route_tools(prompt, provider):
     return routing
 
 def get_pinecone_index():
-    """Initialize Pinecone index for conversation storage."""
+    """Resolve Pinecone index host + dimension using Pinecone REST API."""
     if not config["pinecone_api_key"]:
-        return None, "PINECONE_API_KEY is not configured.", None
+        return None, None, "PINECONE_API_KEY is not configured.", None
+
+    index_name = config["pinecone_index_name"]
+    headers = {
+        "Api-Key": config["pinecone_api_key"],
+        "Accept": "application/json",
+    }
 
     try:
-        try:
-            from pinecone import Pinecone
-        except Exception as primary_import_error:
-            try:
-                from pinecone.grpc import PineconeGRPC as Pinecone
-            except Exception as grpc_import_error:
-                return (
-                    None,
-                    "Pinecone import failed. "
-                    f"Standard import error: {primary_import_error}. "
-                    f"gRPC fallback import error: {grpc_import_error}",
-                    None,
-                )
+        response = requests.get(
+            f"https://api.pinecone.io/indexes/{index_name}",
+            headers=headers,
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return None, None, f"Pinecone index '{index_name}' does not exist.", None
 
-        pc = Pinecone(api_key=config["pinecone_api_key"])
+        response.raise_for_status()
+        data = response.json()
 
-        raw_indexes = pc.list_indexes()
-        if hasattr(raw_indexes, "names"):
-            existing_indexes = list(raw_indexes.names())
-        elif isinstance(raw_indexes, list):
-            existing_indexes = [getattr(idx, "name", str(idx)) for idx in raw_indexes]
-        elif isinstance(raw_indexes, dict) and "indexes" in raw_indexes:
-            existing_indexes = [idx.get("name", "") for idx in raw_indexes.get("indexes", [])]
-        else:
-            existing_indexes = []
+        host = data.get("host") or data.get("status", {}).get("host")
+        dimension = data.get("dimension")
+        if dimension is None:
+            spec = data.get("spec", {})
+            dimension = spec.get("dimension")
 
-        if config["pinecone_index_name"] not in existing_indexes:
-            return None, f"Pinecone index '{config['pinecone_index_name']}' does not exist.", None
+        if not host:
+            return None, None, "Pinecone index host could not be resolved.", None
 
-        index_info = pc.describe_index(config["pinecone_index_name"])
-        index_dimension = getattr(index_info, "dimension", None)
-        if index_dimension is None and isinstance(index_info, dict):
-            index_dimension = index_info.get("dimension")
-
-        return pc.Index(config["pinecone_index_name"]), "", index_dimension
-    except Exception as exc:
-        return None, f"Pinecone client initialization failed: {exc}", None
+        return host, headers, "", dimension
+    except requests.RequestException as exc:
+        return None, None, f"Pinecone index lookup failed: {exc}", None
 
 
 @traceable(name="store_conversation_pinecone", run_type="tool")
 def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
-    """Store a single user/assistant turn in Pinecone."""
-    index, init_error, index_dimension = get_pinecone_index()
-    if index is None:
-        return {"success": False, "reason": init_error, "vector_id": "", "error_type": "init_error"}
+    """Store a single user/assistant turn in Pinecone via REST upsert."""
+    index_host, headers, init_error, index_dimension = get_pinecone_index()
+    if not index_host:
+        return {
+            "success": False,
+            "reason": init_error,
+            "vector_id": "",
+            "error_type": "init_error",
+            "index_dimension": index_dimension,
+        }
 
     text_payload = f"User: {user_message}\nAssistant: {assistant_message}"
 
@@ -430,12 +428,13 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "input": text_payload,
         }
         if index_dimension:
-            if index_dimension > 1536:
+            if int(index_dimension) > 1536:
                 return {
                     "success": False,
                     "reason": f"Index dimension {index_dimension} is larger than text-embedding-3-small max 1536.",
                     "vector_id": "",
                     "error_type": "dimension_mismatch",
+                    "index_dimension": index_dimension,
                 }
             embedding_params["dimensions"] = int(index_dimension)
 
@@ -450,8 +449,32 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "source": "streamlit_chat",
         }
 
-        index.upsert(vectors=[{"id": vector_id, "values": embedding, "metadata": metadata}])
-        return {"success": True, "reason": "", "vector_id": vector_id, "error_type": "", "index_dimension": index_dimension}
+        upsert_response = requests.post(
+            f"https://{index_host}/vectors/upsert",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "vectors": [{"id": vector_id, "values": embedding, "metadata": metadata}],
+                "namespace": "__default__",
+            },
+            timeout=15,
+        )
+        upsert_response.raise_for_status()
+
+        return {
+            "success": True,
+            "reason": "",
+            "vector_id": vector_id,
+            "error_type": "",
+            "index_dimension": index_dimension,
+        }
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "reason": f"Pinecone REST upsert failed: {exc}",
+            "vector_id": "",
+            "error_type": type(exc).__name__,
+            "index_dimension": index_dimension,
+        }
     except Exception as exc:
         return {
             "success": False,
