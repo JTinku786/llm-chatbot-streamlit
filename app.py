@@ -118,7 +118,9 @@ def load_config():
             "langsmith_api_key": st.secrets.get("LANGSMITH_API_KEY", ""),
             "langsmith_project": st.secrets.get("LANGSMITH_PROJECT", "llm-chatbot-streamlit"),
             "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
-            "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", "")
+            "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", ""),
+            "serpapi_api_key": st.secrets.get("SERPAPI_API_KEY", ""),
+            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", "")
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -148,6 +150,117 @@ def stream_chat_completion(selected_model, messages, temperature):
 
 
 
+
+
+
+def extract_search_query(prompt):
+    """Extract web-search query from user prompt."""
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+
+    if prompt_lower.startswith('/search '):
+        return prompt_clean[len('/search '):].strip()
+    if prompt_lower.startswith('search '):
+        return prompt_clean[len('search '):].strip()
+    if prompt_lower.startswith('google '):
+        return prompt_clean[len('google '):].strip()
+    if prompt_lower.startswith('look up '):
+        return prompt_clean[len('look up '):].strip()
+
+    return ''
+
+
+def search_with_serpapi(query, max_results=5):
+    """Fetch search results from SerpAPI."""
+    if not config["serpapi_api_key"]:
+        return [], "SERPAPI_API_KEY is not configured."
+
+    try:
+        response = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "q": query,
+                "api_key": config["serpapi_api_key"],
+                "num": max_results,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("organic_results", [])[:max_results]
+        results = [
+            {
+                "title": item.get("title", "Untitled"),
+                "snippet": item.get("snippet", ""),
+                "url": item.get("link", ""),
+            }
+            for item in items
+        ]
+        return results, ""
+    except requests.RequestException as exc:
+        return [], f"SerpAPI search failed: {exc}"
+
+
+def search_with_tavily(query, max_results=5):
+    """Fetch search results from Tavily."""
+    if not config["tavily_api_key"]:
+        return [], "TAVILY_API_KEY is not configured."
+
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": config["tavily_api_key"],
+                "query": query,
+                "max_results": max_results,
+                "include_answer": True,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("results", [])[:max_results]
+        results = [
+            {
+                "title": item.get("title", "Untitled"),
+                "snippet": item.get("content", ""),
+                "url": item.get("url", ""),
+            }
+            for item in items
+        ]
+        if data.get("answer"):
+            results.insert(0, {"title": "Tavily Answer", "snippet": data["answer"], "url": ""})
+        return results[:max_results], ""
+    except requests.RequestException as exc:
+        return [], f"Tavily search failed: {exc}"
+
+
+def load_web_search_context(query, provider):
+    """Load web search context from selected provider."""
+    provider_order = {
+        "Auto": ["Tavily", "SerpAPI"],
+        "Tavily": ["Tavily"],
+        "SerpAPI": ["SerpAPI"],
+    }
+
+    provider_map = {
+        "Tavily": search_with_tavily,
+        "SerpAPI": search_with_serpapi,
+    }
+
+    errors = []
+    for provider_name in provider_order.get(provider, [provider]):
+        results, error = provider_map[provider_name](query)
+        if results:
+            lines = [
+                f"[{idx}] {item['title']}\n{item['snippet']}\n{item['url']}"
+                for idx, item in enumerate(results, start=1)
+            ]
+            return "\n\n".join(lines), provider_name, ""
+        if error:
+            errors.append(f"{provider_name}: {error}")
+
+    return "", "", " | ".join(errors) if errors else "No search results found."
 
 def extract_weather_cities(prompt):
     """Extract city names from weather-related prompts."""
@@ -394,6 +507,12 @@ with st.sidebar:
     
     temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
     use_rag = st.toggle("Use Memory (RAG)", value=True)
+    web_search_provider = st.selectbox(
+        "Web Search Provider",
+        ["Auto", "Tavily", "SerpAPI"],
+        index=0,
+        help="Used when you ask with /search, search, google, or look up."
+    )
     
     st.markdown("---")
     st.markdown("### 📊 Stats")
@@ -446,7 +565,7 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Ask anything... (weather in city / /weather city1, city2)"):
+if prompt := st.chat_input("Ask anything... (weather in city, /weather, /search)"):
     # Prepare user message content
     user_message_content = []
 
@@ -458,6 +577,15 @@ if prompt := st.chat_input("Ask anything... (weather in city / /weather city1, c
             st.warning(weather_error)
         elif weather_context:
             st.info(f"Fetched weather data for: {', '.join(city_list)}")
+
+    search_context = ""
+    search_query = extract_search_query(prompt)
+    if search_query:
+        search_context, provider_used, search_error = load_web_search_context(search_query, web_search_provider)
+        if search_error:
+            st.warning(search_error)
+        elif search_context:
+            st.info(f"Loaded web search context from {provider_used} for: {search_query}")
 
     # Add text
     user_message_content.append({"type": "text", "text": prompt})
@@ -481,6 +609,9 @@ if prompt := st.chat_input("Ask anything... (weather in city / /weather city1, c
 
     if weather_context:
         user_message_content.append({"type": "text", "text": f"\n\nLive weather context:\n{weather_context}"})
+
+    if search_context:
+        user_message_content.append({"type": "text", "text": f"\n\nWeb search context:\n{search_context}\n\nUse this context with citations when relevant."})
 
     current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
     

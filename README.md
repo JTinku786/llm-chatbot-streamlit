@@ -25,3 +25,22 @@ Add this secret to Streamlit Cloud:
 - `OPENWEATHERMAP_API_KEY`
 
 This key is used to call the OpenWeatherMap current weather API and include live weather context in the prompt.
+
+
+## Web search tools
+
+The chat supports web search augmentation with these prompt formats:
+
+- `/search latest AI news`
+- `search NVIDIA quarterly results`
+- `google best cafes in hyderabad`
+- `look up python 3.13 release notes`
+
+Supported providers in the sidebar: `Auto`, `Tavily`, `SerpAPI`.
+
+Add secrets in Streamlit Cloud:
+
+- `TAVILY_API_KEY`
+- `SERPAPI_API_KEY`
+
+In `Auto` mode, the app tries Tavily first, then SerpAPI.
