@@ -63,8 +63,3 @@ This routing is traced in LangSmith with dedicated runs (`tool_router`, `weather
 Each completed chat turn (user + assistant) is persisted to Pinecone when `PINECONE_API_KEY` and an existing `PINECONE_INDEX_NAME` are configured.
 
 Stored metadata includes: `chat_id`, `timestamp`, `user_message`, `assistant_message`, and `source`.
-
-If persistence is skipped, the LangSmith `store_conversation_pinecone` run now returns a reason (for example missing API key, missing index, or upsert failure).
-
-
-If `store_conversation_pinecone` fails, check the `reason` in LangSmith output and sidebar. This now includes detailed init/import/upsert errors (including Pinecone import/plugin issues).
