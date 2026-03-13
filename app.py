@@ -14,6 +14,7 @@ import base64
 from io import BytesIO
 from datetime import datetime
 import json
+import re
 import requests
 from pypdf import PdfReader
 from pptx import Presentation
@@ -145,6 +146,32 @@ def stream_chat_completion(selected_model, messages, temperature):
     )
 
 
+
+
+
+def extract_weather_cities(prompt):
+    """Extract city names from weather-related prompts."""
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+
+    if prompt_lower.startswith('/weather '):
+        city_fragment = prompt_clean[len('/weather '):]
+    elif 'weather in ' in prompt_lower:
+        start = prompt_lower.find('weather in ') + len('weather in ')
+        city_fragment = prompt_clean[start:]
+    elif prompt_lower.startswith('weather '):
+        city_fragment = prompt_clean[len('weather '):]
+    else:
+        return []
+
+    city_fragment = re.split(r'[?.!\n]', city_fragment, maxsplit=1)[0]
+    city_fragment = city_fragment.strip()
+    if not city_fragment:
+        return []
+
+    city_fragment = re.sub(r'\b(today|now|currently|please)\b', '', city_fragment, flags=re.IGNORECASE).strip()
+    parts = re.split(r',|\band\b|&', city_fragment, flags=re.IGNORECASE)
+    return [part.strip(' .') for part in parts if part.strip(' .')]
 
 def load_weather_context(cities):
     """Load weather context for the given cities using OpenWeatherMap."""
@@ -419,14 +446,13 @@ for message in current_chat["messages"]:
             st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Message AI Assistant... (use /weather city1, city2)"):
+if prompt := st.chat_input("Ask anything... (weather in city / /weather city1, city2)"):
     # Prepare user message content
     user_message_content = []
 
     weather_context = ""
-    if prompt.lower().startswith("/weather "):
-        city_input = prompt[len("/weather "):].strip()
-        city_list = [city.strip() for city in city_input.split(",")]
+    city_list = extract_weather_cities(prompt)
+    if city_list:
         weather_context, weather_error = load_weather_context(city_list)
         if weather_error:
             st.warning(weather_error)

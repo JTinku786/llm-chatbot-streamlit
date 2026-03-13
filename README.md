@@ -18,6 +18,7 @@ When `LANGSMITH_API_KEY` is set, the app enables LangSmith tracing and wraps Ope
 The chat supports on-demand weather lookup using the command format:
 
 - `/weather chennai, vellore`
+- `weather in bodhan`
 
 Add this secret to Streamlit Cloud:
 
