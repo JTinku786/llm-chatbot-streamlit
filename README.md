@@ -86,14 +86,24 @@ Note: Pinecone upserts use the default namespace (no explicit namespace field) f
 
 ## ICT Concept RAG
 
-Enable **Include ICT Concept Technology (RAG)** in the sidebar to use a simple RAG flow against your ICT Pinecone index.
+Enable **Include ICT Concept Technology (RAG)** in the sidebar to use grounded ICT retrieval.
 
-Flow:
-1. Embed user query with `text-embedding-3-small`
-2. Retrieve top ICT chunks from Pinecone
-3. Build context from retrieved chunks
-4. Inject context into the prompt before final LLM answer
+Production retrieval flow:
+1. Intent router identifies ICT retrieval request.
+2. Query rewrite disambiguates ICT terms.
+3. Retrieve from `ICT_KNOWLEDGE_INDEX` only (never from chat-memory index).
+4. Apply metadata/domain/source/trust filters.
+5. Apply confidence threshold (default `0.3`) and reject low-quality matches.
+6. Inject only trusted context chunks into final LLM prompt.
 
-Required secrets:
+Memory handling:
+- Conversation turns are stored in a **separate** `CHAT_MEMORY_INDEX`.
+- Controlled memory injection summarizes only the last 5 turns to reduce cross-topic contamination.
+- Chat memory vectors use structured metadata (`source_id`, `doc_id`, `chunk_id`, `domain`, `trust_tier`).
+
+Recommended secrets:
 - `PINECONE_API_KEY`
-- `PINECONE_INDEX_NAME` (your ICT index)
+- `ICT_KNOWLEDGE_INDEX` (example: `ict_knowledge_index`)
+- `CHAT_MEMORY_INDEX` (example: `chat_memory_index`)
+- `ICT_DOMAIN` (default: `ict_trading`)
+- `RETRIEVAL_SCORE_THRESHOLD` (default: `0.3`)

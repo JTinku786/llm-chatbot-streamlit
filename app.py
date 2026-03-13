@@ -122,7 +122,11 @@ def load_config():
             "langsmith_endpoint": st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
             "openweathermap_api_key": st.secrets.get("OPENWEATHERMAP_API_KEY", ""),
             "serpapi_api_key": st.secrets.get("SERPAPI_API_KEY", ""),
-            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", "")
+            "tavily_api_key": st.secrets.get("TAVILY_API_KEY", ""),
+            "ict_knowledge_index_name": st.secrets.get("ICT_KNOWLEDGE_INDEX", st.secrets.get("PINECONE_INDEX_NAME", os.getenv("PINECONE_INDEX_NAME", "ict-knowledge-index"))),
+            "chat_memory_index_name": st.secrets.get("CHAT_MEMORY_INDEX", os.getenv("CHAT_MEMORY_INDEX", "chat-memory-index")),
+            "ict_domain": st.secrets.get("ICT_DOMAIN", "ict_trading"),
+            "retrieval_score_threshold": float(st.secrets.get("RETRIEVAL_SCORE_THRESHOLD", 0.3)),
         }
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
@@ -153,6 +157,87 @@ def stream_chat_completion(selected_model, messages, temperature):
 
 
 
+
+
+
+
+@traceable(name="rewrite_ict_query", run_type="tool")
+def rewrite_ict_query(query, model="gpt-4.1-mini"):
+    """Rewrite ambiguous ICT questions to retrieval-friendly form."""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Rewrite the user query for ICT (Inner Circle Trader) document retrieval. Keep intent unchanged, add disambiguating ICT terms if vague, and return only one concise rewritten query."},
+                {"role": "user", "content": query},
+            ],
+            temperature=0.0,
+            max_tokens=80,
+        )
+        rewritten = (resp.choices[0].message.content or "").strip()
+        return rewritten or query
+    except Exception:
+        return query
+
+
+@traceable(name="summarize_last_5_turns", run_type="tool")
+def summarize_last_5_turns(messages, model="gpt-4.1-mini"):
+    """Controlled memory injection: summarize only last 5 turns."""
+    turns = []
+    for msg in messages:
+        role = msg.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            content = "\n".join(text_parts)
+        turns.append(f"{role}: {str(content)[:1000]}")
+
+    if not turns:
+        return ""
+
+    window = turns[-10:]
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Summarize the conversation memory in <=8 bullet points. Preserve facts, open tasks, constraints, and user preferences. Exclude unrelated topics."},
+                {"role": "user", "content": "\n".join(window)},
+            ],
+            temperature=0.0,
+            max_tokens=220,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+
+def resolve_pinecone_index(index_name):
+    """Resolve Pinecone index host + dimension using REST API."""
+    if not config["pinecone_api_key"]:
+        return None, None, "PINECONE_API_KEY is not configured.", None
+
+    headers = {"Api-Key": config["pinecone_api_key"], "Accept": "application/json"}
+    try:
+        response = requests.get(
+            f"https://api.pinecone.io/indexes/{index_name}",
+            headers=headers,
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return None, None, f"Pinecone index '{index_name}' does not exist.", None
+        response.raise_for_status()
+        data = response.json()
+        host = data.get("host") or data.get("status", {}).get("host")
+        dimension = data.get("dimension")
+        if dimension is None:
+            dimension = data.get("spec", {}).get("dimension")
+        if not host:
+            return None, None, "Pinecone index host could not be resolved.", None
+        return host, headers, "", dimension
+    except requests.RequestException as exc:
+        return None, None, f"Pinecone index lookup failed: {exc}", None
 
 
 def extract_search_query(prompt):
@@ -373,119 +458,114 @@ def route_tools(prompt, provider):
 
 
 @traceable(name="ict_retrieve_chunks", run_type="tool")
-def retrieve_ict_chunks(query, top_k=8):
-    """Simple dense retrieval from Pinecone ICT index via REST."""
-    if not config["pinecone_api_key"]:
-        return [], "PINECONE_API_KEY is not configured."
-
-    index_name = config["pinecone_index_name"]
-    headers = {"Api-Key": config["pinecone_api_key"], "Accept": "application/json"}
+def retrieve_ict_chunks(query, top_k=8, domain_filter="ict_trading", source_filter="", trust_tier="approved", score_threshold=0.3):
+    """Dense retrieval from ICT knowledge index with production filters + confidence gating."""
+    index_host, headers, init_error, index_dimension = resolve_pinecone_index(config["ict_knowledge_index_name"])
+    if not index_host:
+        return [], {"error": init_error}
 
     try:
-        idx_resp = requests.get(
-            f"https://api.pinecone.io/indexes/{index_name}",
-            headers=headers,
-            timeout=15,
-        )
-        if idx_resp.status_code == 404:
-            return [], f"Pinecone index '{index_name}' does not exist."
-        idx_resp.raise_for_status()
-        idx_data = idx_resp.json()
-        host = idx_data.get("host") or idx_data.get("status", {}).get("host")
-        dimension = idx_data.get("dimension") or idx_data.get("spec", {}).get("dimension")
-        if not host:
-            return [], "Pinecone index host could not be resolved."
-
         emb_params = {"model": "text-embedding-3-small", "input": [query], "encoding_format": "float"}
-        if dimension and int(dimension) <= 1536:
-            emb_params["dimensions"] = int(dimension)
+        if index_dimension and int(index_dimension) <= 1536:
+            emb_params["dimensions"] = int(index_dimension)
         q_emb = client.embeddings.create(**emb_params).data[0].embedding
 
+        and_filters = [{"source": {"$ne": "streamlit_chat"}}]
+        if domain_filter:
+            and_filters.append({"domain": {"$eq": domain_filter}})
+        if source_filter:
+            and_filters.append({"source": {"$eq": source_filter}})
+        if trust_tier and trust_tier.lower() != "all":
+            and_filters.append({"trust_tier": {"$eq": trust_tier}})
+
+        query_body = {
+            "vector": q_emb,
+            "topK": top_k,
+            "includeMetadata": True,
+            "filter": {"$and": and_filters},
+        }
+
         query_resp = requests.post(
-            f"https://{host}/query",
+            f"https://{index_host}/query",
             headers={**headers, "Content-Type": "application/json"},
-            json={
-                "vector": q_emb,
-                "topK": top_k,
-                "includeMetadata": True,
-            },
+            json=query_body,
             timeout=20,
         )
         if query_resp.status_code >= 400:
-            return [], f"Pinecone query failed HTTP {query_resp.status_code}: {query_resp.text[:800]}"
+            return [], {"error": f"Pinecone query failed HTTP {query_resp.status_code}: {query_resp.text[:800]}"}
 
         matches = query_resp.json().get("matches", [])
-        docs = []
+        all_docs = []
         for m in matches:
             meta = m.get("metadata", {}) or {}
-            docs.append({
+            all_docs.append({
+                "source_id": meta.get("source_id", ""),
+                "doc_id": meta.get("doc_id", ""),
                 "source": meta.get("source", "unknown"),
+                "domain": meta.get("domain", ""),
+                "trust_tier": meta.get("trust_tier", ""),
                 "chunk_id": meta.get("chunk_id", ""),
                 "text": meta.get("text", ""),
-                "score": m.get("score", 0),
+                "score": float(m.get("score", 0)),
             })
-        return docs, ""
+
+        accepted = [d for d in all_docs if d["score"] >= score_threshold]
+        rejected = len(all_docs) - len(accepted)
+        info = {
+            "error": "",
+            "filters": {
+                "domain": domain_filter or "any",
+                "source": source_filter or "any",
+                "trust_tier": trust_tier or "any",
+                "exclude_source": "streamlit_chat",
+            },
+            "score_threshold": score_threshold,
+            "retrieved_total": len(all_docs),
+            "accepted_total": len(accepted),
+            "rejected_low_quality": rejected,
+            "index_name": config["ict_knowledge_index_name"],
+        }
+        if not accepted:
+            info["error"] = "No high-confidence ICT chunks after filtering/threshold."
+        return accepted, info
     except requests.RequestException as exc:
-        return [], f"ICT retrieval failed: {exc}"
+        return [], {"error": f"ICT retrieval failed: {exc}"}
 
 
-def build_ict_rag_context(query, top_k=8):
-    """Build simple RAG context string from ICT chunks."""
-    docs, err = retrieve_ict_chunks(query, top_k=top_k)
+def build_ict_rag_context(query, top_k=8, domain_filter="ict_trading", source_filter="", trust_tier="approved", score_threshold=0.3, rewrite_model="gpt-4.1-mini"):
+    """Build filtered RAG context with retrieval diagnostics."""
+    rewritten_query = rewrite_ict_query(query, model=rewrite_model)
+    docs, info = retrieve_ict_chunks(
+        rewritten_query,
+        top_k=top_k,
+        domain_filter=domain_filter,
+        source_filter=source_filter,
+        trust_tier=trust_tier,
+        score_threshold=score_threshold,
+    )
+    err = info.get("error", "")
     if err:
-        return "", [], err
+        return "", [], info, rewritten_query
 
     parts = []
     for i, d in enumerate(docs, start=1):
         parts.append(
-            f"### Chunk {i} (source: {d['source']}, chunk_id: {d['chunk_id']}, score: {d['score']:.3f})\n"
+            f"### Chunk {i} (doc_id: {d['doc_id']}, chunk_id: {d['chunk_id']}, source: {d['source']}, domain: {d['domain']}, trust_tier: {d['trust_tier']}, score: {d['score']:.3f})\n"
             f"{d['text'][:1200]}"
         )
 
-    return "\n\n".join(parts), docs, ""
+    return "\n\n".join(parts), docs, info, rewritten_query
 
 
-def get_pinecone_index():
-    """Resolve Pinecone index host + dimension using Pinecone REST API."""
-    if not config["pinecone_api_key"]:
-        return None, None, "PINECONE_API_KEY is not configured.", None
-
-    index_name = config["pinecone_index_name"]
-    headers = {
-        "Api-Key": config["pinecone_api_key"],
-        "Accept": "application/json",
-    }
-
-    try:
-        response = requests.get(
-            f"https://api.pinecone.io/indexes/{index_name}",
-            headers=headers,
-            timeout=15,
-        )
-        if response.status_code == 404:
-            return None, None, f"Pinecone index '{index_name}' does not exist.", None
-
-        response.raise_for_status()
-        data = response.json()
-
-        host = data.get("host") or data.get("status", {}).get("host")
-        dimension = data.get("dimension")
-        if dimension is None:
-            spec = data.get("spec", {})
-            dimension = spec.get("dimension")
-
-        if not host:
-            return None, None, "Pinecone index host could not be resolved.", None
-
-        return host, headers, "", dimension
-    except requests.RequestException as exc:
-        return None, None, f"Pinecone index lookup failed: {exc}", None
+def get_pinecone_index(index_name=None):
+    """Backward-compatible wrapper for chat memory index resolution."""
+    return resolve_pinecone_index(index_name or config["chat_memory_index_name"])
 
 
 @traceable(name="store_conversation_pinecone", run_type="tool")
-def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
-    """Store a single user/assistant turn in Pinecone via REST upsert."""
-    index_host, headers, init_error, index_dimension = get_pinecone_index()
+def store_conversation_in_pinecone(chat_id, user_message, assistant_message, summary=""):
+    """Store chat memory only in chat-memory index (never in ICT knowledge index)."""
+    index_host, headers, init_error, index_dimension = get_pinecone_index(config["chat_memory_index_name"])
     if not index_host:
         return {
             "success": False,
@@ -493,15 +573,13 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "vector_id": "",
             "error_type": "init_error",
             "index_dimension": index_dimension,
+            "index_name": config["chat_memory_index_name"],
         }
 
-    text_payload = f"User: {user_message}\nAssistant: {assistant_message}"
+    text_payload = f"User: {user_message}\nAssistant: {assistant_message}\nSummary: {summary}"
 
     try:
-        embedding_params = {
-            "model": "text-embedding-3-small",
-            "input": text_payload,
-        }
+        embedding_params = {"model": "text-embedding-3-small", "input": text_payload}
         if index_dimension:
             if int(index_dimension) > 1536:
                 return {
@@ -510,23 +588,29 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
                     "vector_id": "",
                     "error_type": "dimension_mismatch",
                     "index_dimension": index_dimension,
+                    "index_name": config["chat_memory_index_name"],
                 }
             embedding_params["dimensions"] = int(index_dimension)
 
         embedding = client.embeddings.create(**embedding_params).data[0].embedding
 
-        vector_id = f"{chat_id}-{uuid.uuid4()}"
+        turn_id = str(uuid.uuid4())
+        vector_id = f"chat-{chat_id}-{turn_id}"
         metadata = {
+            "source_id": f"chat_{chat_id}",
+            "doc_id": f"chat_session_{chat_id}",
+            "chunk_id": f"turn_{turn_id}",
             "chat_id": chat_id,
             "timestamp": datetime.utcnow().isoformat(),
             "user_message": user_message[:2000],
             "assistant_message": assistant_message[:2000],
+            "conversation_summary": summary[:2000],
             "source": "streamlit_chat",
+            "domain": "chat_memory",
+            "trust_tier": "user_generated",
         }
 
-        upsert_payload = {
-            "vectors": [{"id": vector_id, "values": embedding, "metadata": metadata}]
-        }
+        upsert_payload = {"vectors": [{"id": vector_id, "values": embedding, "metadata": metadata}]}
         upsert_response = requests.post(
             f"https://{index_host}/vectors/upsert",
             headers={**headers, "Content-Type": "application/json"},
@@ -538,14 +622,12 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             error_body = upsert_response.text[:1000]
             return {
                 "success": False,
-                "reason": (
-                    f"Pinecone REST upsert failed: HTTP {upsert_response.status_code}. "
-                    f"Response: {error_body}"
-                ),
+                "reason": f"Pinecone REST upsert failed: HTTP {upsert_response.status_code}. Response: {error_body}",
                 "vector_id": "",
                 "error_type": "HTTPError",
                 "index_dimension": index_dimension,
                 "embedding_length": len(embedding),
+                "index_name": config["chat_memory_index_name"],
             }
 
         return {
@@ -555,6 +637,7 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "error_type": "",
             "index_dimension": index_dimension,
             "embedding_length": len(embedding),
+            "index_name": config["chat_memory_index_name"],
         }
     except requests.RequestException as exc:
         return {
@@ -564,6 +647,7 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "error_type": type(exc).__name__,
             "index_dimension": index_dimension,
             "embedding_length": 0,
+            "index_name": config["chat_memory_index_name"],
         }
     except Exception as exc:
         return {
@@ -572,6 +656,7 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message):
             "vector_id": "",
             "error_type": type(exc).__name__,
             "index_dimension": index_dimension,
+            "index_name": config["chat_memory_index_name"],
         }
 
 
@@ -771,6 +856,9 @@ with st.sidebar:
 
     st.markdown("### 📚 ICT Concept RAG")
     use_ict_rag = st.checkbox("Include ICT Concept Technology (RAG)", value=False)
+    rag_domain_filter = st.text_input("RAG Domain Filter", value=config["ict_domain"], help="Example: ict_trading")
+    rag_source_filter = st.text_input("RAG Source Filter", value="", help="Optional source filter, e.g., ict_manual")
+    rag_trust_tier = st.selectbox("RAG Trust Tier", ["approved", "all"], index=0)
 
     st.markdown("---")
     st.markdown("### 📊 Stats")
@@ -842,16 +930,34 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
         st.info(f"Loaded web search context from {routing['provider_used']} for: {routing['search_query']}")
 
     ict_context = ""
+    memory_summary = summarize_last_5_turns(current_chat["messages"], model=selected_model)
     if use_ict_rag:
-        ict_context, ict_sources, ict_error = build_ict_rag_context(prompt, top_k=8)
-        if ict_error:
-            st.warning(f"ICT RAG skipped: {ict_error}")
+        ict_context, ict_sources, ict_info, rewritten_query = build_ict_rag_context(
+            prompt,
+            top_k=8,
+            domain_filter=rag_domain_filter,
+            source_filter=rag_source_filter,
+            trust_tier=rag_trust_tier,
+            score_threshold=config["retrieval_score_threshold"],
+            rewrite_model=selected_model,
+        )
+        if ict_info.get("error"):
+            st.warning(f"ICT RAG skipped: {ict_info['error']}")
         else:
-            st.info(f"ICT RAG loaded with {len(ict_sources)} chunks.")
-            with st.expander("📚 ICT RAG Sources", expanded=False):
+            st.info(
+                f"ICT RAG loaded {ict_info['accepted_total']}/{ict_info['retrieved_total']} chunks "
+                f"(rejected low-quality: {ict_info['rejected_low_quality']}, threshold: {ict_info['score_threshold']})."
+            )
+            with st.expander("📚 ICT RAG Sources + Retrieval Filters", expanded=False):
+                st.markdown(
+                    f"**Rewritten query:** `{rewritten_query}`\n\n"
+                    f"**Filters:** domain=`{ict_info['filters']['domain']}`, source=`{ict_info['filters']['source']}`, "
+                    f"trust_tier=`{ict_info['filters']['trust_tier']}`, exclude_source=`{ict_info['filters']['exclude_source']}`"
+                )
                 for src in ict_sources:
                     st.markdown(
-                        f"- `{src['source']}` | chunk `{src['chunk_id']}` | score `{src['score']:.4f}`"
+                        f"- source_id `{src['source_id']}` | doc_id `{src['doc_id']}` | source `{src['source']}` | "
+                        f"domain `{src['domain']}` | trust `{src['trust_tier']}` | chunk `{src['chunk_id']}` | score `{src['score']:.4f}`"
                     )
 
     # Add text
@@ -889,6 +995,12 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
             ),
         })
 
+    if memory_summary:
+        user_message_content.append({
+            "type": "text",
+            "text": f"\n\nConversation summary (last 5 turns only; avoid unrelated topic leakage):\n{memory_summary}",
+        })
+
     current_chat["messages"].append({"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt})
     
     with st.chat_message("user"):
@@ -896,7 +1008,17 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
     
     with st.chat_message("assistant"):
         try:
-            response = stream_chat_completion(selected_model, current_chat["messages"], temperature)
+            llm_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a production-grade assistant. Prioritize trusted ICT context when provided. "
+                        "Do not mix unrelated prior topics. If context is insufficient, state uncertainty."
+                    ),
+                },
+                {"role": "user", "content": user_message_content if len(user_message_content) > 1 else prompt},
+            ]
+            response = stream_chat_completion(selected_model, llm_messages, temperature)
             full_response = ""
             placeholder = st.empty()
             for chunk in response:
@@ -908,6 +1030,7 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
                 st.session_state.current_chat_id,
                 prompt,
                 full_response,
+                summary=memory_summary,
             )
             if not pinecone_status["success"]:
                 st.sidebar.warning(f"Pinecone store skipped: {pinecone_status['reason']}")
