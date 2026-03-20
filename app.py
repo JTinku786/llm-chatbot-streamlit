@@ -12,16 +12,24 @@ from openai  import OpenAI
 from PIL import Image
 import base64
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import json
 import re
 import requests
+import warnings
 from pypdf import PdfReader
 from src.rag.ict_rag import resolve_index, build_sparse_vector, run_pinecone_query, rerank_documents, transform_query
 from pptx import Presentation
 import docx
 from src.routes.ict_investigation import extract_ict_entity, run_infy_route, run_mtf_ict_snapshot
+
+warnings.filterwarnings(
+    "ignore",
+    message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.",
+    category=UserWarning,
+    module=r"langchain_core\._api\.deprecation",
+)
 
 # Page configuration
 st.set_page_config(
@@ -602,7 +610,7 @@ def store_conversation_in_pinecone(chat_id, user_message, assistant_message, sum
             "doc_id": f"chat_session_{chat_id}",
             "chunk_id": f"turn_{turn_id}",
             "chat_id": chat_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "user_message": user_message[:2000],
             "assistant_message": assistant_message[:2000],
             "conversation_summary": summary[:2000],
@@ -927,7 +935,8 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            st.code(json_output, language="json")
+            with st.expander("ICT Investigation JSON", expanded=False):
+                st.json(route_payload, expanded=False)
 
         current_chat["messages"].append({"role": "assistant", "content": json_output})
         pinecone_status = store_conversation_in_pinecone(
