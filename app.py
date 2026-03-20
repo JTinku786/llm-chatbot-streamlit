@@ -18,6 +18,7 @@ import json
 import re
 import requests
 from pypdf import PdfReader
+from src.rag.ict_rag import resolve_index, build_sparse_vector, run_pinecone_query, rerank_documents, transform_query
 from pptx import Presentation
 import docx
 from src.routes.ict_investigation import extract_ict_entity, run_infy_route, run_mtf_ict_snapshot
