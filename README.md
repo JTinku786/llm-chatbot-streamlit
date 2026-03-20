@@ -107,3 +107,14 @@ Recommended secrets:
 - `CHAT_MEMORY_INDEX` (example: `chat_memory_index`)
 - `ICT_DOMAIN` (default: `ict_trading`)
 - `RETRIEVAL_SCORE_THRESHOLD` (default: `0.3`)
+
+
+## ICT Investigation Route (JSON mode)
+
+The app now supports prompt routing for:
+- `ICT investigation for INFY` → dedicated INFY route (`src/routes/ict_investigation.py`)
+- `ICT investigation for <TICKER>` → generic ICT route for that ticker
+
+Current behavior:
+- Returns a JSON response in chat with multi-timeframe (`weekly`, `daily`, `1h`, `30m`, `15m`) OHLC + IPDA(20/40/60) snapshot.
+- This is intentionally JSON-first for validation before future multi-agent forecasting stages.

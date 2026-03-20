@@ -21,6 +21,7 @@ from pypdf import PdfReader
 from src.rag.ict_rag import resolve_index, build_sparse_vector, run_pinecone_query, rerank_documents, transform_query
 from pptx import Presentation
 import docx
+from src.routes.ict_investigation import extract_ict_entity, run_infy_route, run_mtf_ict_snapshot
 
 # Page configuration
 st.set_page_config(
@@ -914,6 +915,30 @@ for message in current_chat["messages"]:
 if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RAG)"):
     # Prepare user message content
     user_message_content = []
+
+    # Dedicated ICT investigation routing (JSON response mode)
+    ict_entity = extract_ict_entity(prompt)
+    if ict_entity:
+        route_payload = run_infy_route() if ict_entity == "INFY" else run_mtf_ict_snapshot(ict_entity, route_name="generic_ict_route")
+        json_output = json.dumps(route_payload, indent=2)
+
+        current_chat["messages"].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            st.code(json_output, language="json")
+
+        current_chat["messages"].append({"role": "assistant", "content": json_output})
+        pinecone_status = store_conversation_in_pinecone(
+            st.session_state.current_chat_id,
+            prompt,
+            json_output,
+            summary=summarize_last_5_turns(current_chat["messages"], model=selected_model),
+        )
+        if not pinecone_status["success"]:
+            st.sidebar.warning(f"Pinecone store skipped: {pinecone_status['reason']}")
+        st.rerun()
 
     routing = route_tools(prompt, web_search_provider)
     weather_context = routing["weather_context"]
