@@ -69,9 +69,9 @@ def _fetch_ohlc(ticker: str, interval: str, period: str, as_of: str | None) -> p
         ticker,
         interval=interval,
         period=period,
-        auto_adjust=False,
-        group_by="column",
-        progress=False,
+        # auto_adjust=False,
+        # group_by="column",
+        # progress=False,
     )
     if df is None or df.empty:
         return pd.DataFrame()
