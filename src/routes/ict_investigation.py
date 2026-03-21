@@ -158,3 +158,16 @@ def run_mtf_ict_snapshot(ticker: str, as_of: str | None = None, route_name: str 
         result["error"] = str(exc)
 
     return result
+
+
+def run_infy_route(as_of: str | None = None) -> dict:
+    """Dedicated INFY route implementation."""
+    return run_mtf_ict_snapshot("INFY", as_of=as_of, route_name="infy_ict_route")
+
+
+def run_ict_investigation(ticker: str, as_of: str | None = None) -> dict:
+    """Compatibility wrapper expected by app.py; returns JSON payload."""
+    normalized = (ticker or "").upper().strip()
+    if normalized == "INFY":
+        return run_infy_route(as_of=as_of)
+    return run_mtf_ict_snapshot(normalized, as_of=as_of, route_name="ict_investigation_route")
