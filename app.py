@@ -926,6 +926,7 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
 
     # Dedicated ICT investigation routing (JSON response mode)
     ict_entity = extract_ict_entity(prompt)
+    ict_as_of = extract_ict_date(prompt)
     if ict_entity:
         route_payload = run_infy_route() if ict_entity == "INFY" else run_mtf_ict_snapshot(ict_entity, route_name="generic_ict_route")
         json_output = json.dumps(route_payload, indent=2)
