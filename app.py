@@ -877,6 +877,7 @@ with st.sidebar:
 
 # Main chat interface
 st.title("💬 AI Chat Assistant")
+st.info("📌 Recommended ICT prompt: `ICT investigation for {Stock}` (optional date: `as of YYYY-MM-DD`).")
 
 # File upload section
 with st.expander("📎 Attach Files (Images, PDFs, PPT, Docs)", expanded=bool(st.session_state.uploaded_files)):
