@@ -22,7 +22,7 @@ from pypdf import PdfReader
 from src.rag.ict_rag import resolve_index, build_sparse_vector, run_pinecone_query, rerank_documents, transform_query
 from pptx import Presentation
 import docx
-from src.routes.ict_investigation import extract_ict_entity, extract_ict_date, run_ict_investigation
+from src.routes.ict_investigation import extract_ict_entity, run_infy_route, run_mtf_ict_snapshot
 
 warnings.filterwarnings(
     "ignore",
@@ -917,17 +917,7 @@ for message in current_chat["messages"]:
                 else:
                     st.markdown(content_part)
         else:
-            if (
-                message["role"] == "assistant"
-                and isinstance(message["content"], dict)
-                and message["content"].get("type") == "ict_investigation"
-            ):
-                payload = message["content"].get("payload", {})
-                ticker = message["content"].get("ticker", "")
-                with st.expander(f"ICT Investigation JSON ({ticker})", expanded=False):
-                    st.json(payload, expanded=False)
-            else:
-                st.markdown(message["content"])
+            st.markdown(message["content"])
 
 # Chat input
 if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RAG)"):
@@ -938,7 +928,7 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
     ict_entity = extract_ict_entity(prompt)
     ict_as_of = extract_ict_date(prompt)
     if ict_entity:
-        route_payload = run_ict_investigation(ict_entity, as_of=ict_as_of)
+        route_payload = run_infy_route() if ict_entity == "INFY" else run_mtf_ict_snapshot(ict_entity, route_name="generic_ict_route")
         json_output = json.dumps(route_payload, indent=2)
 
         current_chat["messages"].append({"role": "user", "content": prompt})
@@ -946,19 +936,10 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.expander(f"ICT Investigation JSON ({ict_entity})", expanded=False):
+            with st.expander("ICT Investigation JSON", expanded=False):
                 st.json(route_payload, expanded=False)
 
-        current_chat["messages"].append(
-            {
-                "role": "assistant",
-                "content": {
-                    "type": "ict_investigation",
-                    "ticker": ict_entity,
-                    "payload": route_payload,
-                },
-            }
-        )
+        current_chat["messages"].append({"role": "assistant", "content": json_output})
         pinecone_status = store_conversation_in_pinecone(
             st.session_state.current_chat_id,
             prompt,

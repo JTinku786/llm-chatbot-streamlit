@@ -1,4 +1,4 @@
-"""ICT investigation utilities producing JSON-ready multi-timeframe snapshots."""
+"""ICT investigation routing/analyzer utilities."""
 
 from __future__ import annotations
 
@@ -20,35 +20,15 @@ TIMEFRAMES = {
     "15m": {"interval": "15m", "period": "30d"},
 }
 
-INTENT_PATTERN = re.compile(r"\bict\s+investigation\b", flags=re.IGNORECASE)
-TICKER_PATTERN = re.compile(r"\b(?:for|on)\s+([A-Za-z.\-]{1,15})\b", flags=re.IGNORECASE)
-DATE_PATTERN = re.compile(r"\b(?:as\s+of|on|date)\s+(\d{4}-\d{2}-\d{2})\b", flags=re.IGNORECASE)
-
 
 def extract_ict_entity(prompt: str) -> str:
-    """Extract ticker from prompts like 'ICT investigation for INFY on 2025-08-01'."""
-    if not prompt or not INTENT_PATTERN.search(prompt):
+    """Extract entity from prompts like 'ICT investigation for INFY'."""
+    if not prompt:
         return ""
-
-    match = TICKER_PATTERN.search(prompt)
+    match = re.search(r"\bict\s+investigation\s+for\s+([A-Za-z.\-]+)\b", prompt, flags=re.IGNORECASE)
     if not match:
         return ""
     return match.group(1).upper()
-
-
-def extract_ict_date(prompt: str) -> str | None:
-    """Extract optional as-of date in YYYY-MM-DD format."""
-    if not prompt or not INTENT_PATTERN.search(prompt):
-        return None
-
-    match = DATE_PATTERN.search(prompt)
-    if not match:
-        return None
-
-    try:
-        return datetime.strptime(match.group(1), "%Y-%m-%d").date().isoformat()
-    except ValueError:
-        return None
 
 
 def _safe_float(v, n=4):
@@ -89,6 +69,9 @@ def _fetch_ohlc(ticker: str, interval: str, period: str, as_of: str | None) -> p
         ticker,
         interval=interval,
         period=period,
+        # auto_adjust=False,
+        # group_by="column",
+        # progress=False,
     )
     if df is None or df.empty:
         return pd.DataFrame()
@@ -132,21 +115,21 @@ def _build_tf_snapshot(ohlc: pd.DataFrame) -> dict:
     }
 
 
+def run_infy_route(as_of: str | None = None) -> dict:
+    """Dedicated INFY route implementation (separate path)."""
+    return run_mtf_ict_snapshot("INFY", as_of=as_of, route_name="infy_ict_route")
+
+
 def run_mtf_ict_snapshot(ticker: str, as_of: str | None = None, route_name: str = "generic_ict_route") -> dict:
-    """Run MTF snapshot (JSON-ready) for the requested ticker/date."""
+    """Run MTF snapshot (JSON-ready) for the requested ticker."""
     result = {
         "ok": True,
         "route": route_name,
-        "ticker": (ticker or "").upper(),
+        "ticker": ticker.upper(),
         "generated_at_utc": datetime.utcnow().isoformat(),
         "as_of_input": as_of,
         "timeframes": {},
     }
-
-    if not result["ticker"]:
-        result["ok"] = False
-        result["error"] = "No stock/ticker provided."
-        return result
 
     try:
         for tf_name, cfg in TIMEFRAMES.items():
