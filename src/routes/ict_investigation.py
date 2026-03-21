@@ -100,6 +100,43 @@ def fetch_ohlc_yf(ticker: str, interval: str, period: str, as_of_str: str | None
     return ohlc
 
 
+def _safe_float(v, n=4):
+    if v is None or pd.isna(v):
+        return None
+    return round(float(v), n)
+
+
+def _compute_ipda(ohlc: pd.DataFrame, n: int) -> dict:
+    if len(ohlc) < n:
+        return {f"ipda{n}_high": None, f"ipda{n}_low": None, f"ipda{n}_pct": None, f"ipda{n}_state": None}
+    hi = ohlc["high"].rolling(window=n, min_periods=n).max().iloc[-1]
+    lo = ohlc["low"].rolling(window=n, min_periods=n).min().iloc[-1]
+    close = float(ohlc["close"].iloc[-1])
+    if pd.isna(hi) or pd.isna(lo) or hi == lo:
+        pct = None
+        state = None
+    else:
+        pct = float(np.clip((close - lo) / (hi - lo), 0.0, 1.0) * 100.0)
+        state = "premium" if close >= ((hi + lo) / 2.0) else "discount"
+    return {f"ipda{n}_high": _safe_float(hi), f"ipda{n}_low": _safe_float(lo), f"ipda{n}_pct": _safe_float(pct, 2), f"ipda{n}_state": state}
+
+
+def _fallback_last_row_features(ohlc: pd.DataFrame) -> dict:
+    last = ohlc.iloc[-1]
+    ipda = {}
+    for n in (20, 40, 60):
+        ipda.update(_compute_ipda(ohlc, n))
+    return {
+        "open": _safe_float(last.get("open")),
+        "high": _safe_float(last.get("high")),
+        "low": _safe_float(last.get("low")),
+        "close": _safe_float(last.get("close")),
+        "volume": _safe_float(last.get("volume"), 0),
+        "ipda": ipda,
+        "engine": "fallback_no_smartmoneyconcepts",
+    }
+
+
 def _resolve_row_timestamp(row, hist_index):
     idx_val = row.name
     if isinstance(idx_val, pd.Timestamp):
@@ -666,10 +703,22 @@ def run_for_timeframe(name: str, cfg: dict, ticker: str, as_of_str: str | None):
     ohlc = fetch_ohlc_yf(ticker, cfg["interval"], cfg["period"], as_of_str)
     if ohlc.empty or len(ohlc) < 5:
         return {"available": False, "reason": "data not available"}
-    last_ts, last_row = compute_last_row_features(ohlc)
+
+    last_ts = ohlc.index[-1]
+    try:
+        _, last_row = compute_last_row_features(ohlc)
+    except ModuleNotFoundError:
+        last_row = _fallback_last_row_features(ohlc)
+
     if last_row is None:
-        return {"available": False, "reason": "data not available"}
-    return {"available": True, "timestamp_et": _to_et(last_ts).isoformat(), "date_et": _to_et(last_ts).strftime("%Y-%m-%d"), "data": last_row}
+        last_row = _fallback_last_row_features(ohlc)
+
+    return {
+        "available": True,
+        "timestamp_et": _to_et(last_ts).isoformat(),
+        "date_et": _to_et(last_ts).strftime("%Y-%m-%d"),
+        "data": last_row,
+    }
 
 
 def run_mtf_ict_snapshot(ticker: str, as_of: str | None = None, route_name: str = "generic_ict_route") -> dict:
