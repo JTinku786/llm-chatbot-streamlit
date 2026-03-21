@@ -31,6 +31,20 @@ def extract_ict_entity(prompt: str) -> str:
     return match.group(1).upper()
 
 
+
+
+def extract_ict_date(prompt: str) -> str | None:
+    """Extract optional as-of date from ICT prompts in YYYY-MM-DD format."""
+    if not prompt:
+        return None
+    match = re.search(r"\b(?:as\s+of|on|date)\s+(\d{4}-\d{2}-\d{2})\b", prompt, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
 def _safe_float(v, n=4):
     if v is None or pd.isna(v):
         return None

@@ -22,7 +22,7 @@ from pypdf import PdfReader
 from src.rag.ict_rag import resolve_index, build_sparse_vector, run_pinecone_query, rerank_documents, transform_query
 from pptx import Presentation
 import docx
-from src.routes.ict_investigation import extract_ict_entity, run_infy_route, run_mtf_ict_snapshot
+from src.routes.ict_investigation import extract_ict_entity, extract_ict_date, run_infy_route, run_mtf_ict_snapshot
 
 warnings.filterwarnings(
     "ignore",
@@ -928,7 +928,7 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
     ict_entity = extract_ict_entity(prompt)
     ict_as_of = extract_ict_date(prompt)
     if ict_entity:
-        route_payload = run_infy_route() if ict_entity == "INFY" else run_mtf_ict_snapshot(ict_entity, route_name="generic_ict_route")
+        route_payload = run_infy_route(as_of=ict_as_of) if ict_entity == "INFY" else run_mtf_ict_snapshot(ict_entity, as_of=ict_as_of, route_name="generic_ict_route")
         json_output = json.dumps(route_payload, indent=2)
 
         current_chat["messages"].append({"role": "user", "content": prompt})
