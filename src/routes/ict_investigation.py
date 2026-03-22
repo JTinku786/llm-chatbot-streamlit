@@ -705,8 +705,10 @@ def run_for_timeframe(name: str, cfg: dict, ticker: str, as_of_str: str | None):
         return {"available": False, "reason": "data not available"}
 
     last_ts = ohlc.index[-1]
+    # Limit bars for SMC loop performance to keep chat responses fast.
+    smc_ohlc = ohlc.tail(260).copy()
     try:
-        _, last_row = compute_last_row_features(ohlc)
+        _, last_row = compute_last_row_features(smc_ohlc)
     except ModuleNotFoundError:
         last_row = _fallback_last_row_features(ohlc)
 
