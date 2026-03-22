@@ -22,7 +22,7 @@ from pypdf import PdfReader
 from src.rag.ict_rag import resolve_index, build_sparse_vector, run_pinecone_query, rerank_documents, transform_query
 from pptx import Presentation
 import docx
-from src.routes.ict_investigation import extract_ict_entity, run_ict_investigation
+from src.routes.ict_investigation import extract_ict_entity, extract_ict_date, run_infy_route, run_mtf_ict_snapshot
 
 warnings.filterwarnings(
     "ignore",
@@ -877,6 +877,7 @@ with st.sidebar:
 
 # Main chat interface
 st.title("💬 AI Chat Assistant")
+st.info("📌 Recommended ICT prompt: `ICT investigation for {Stock}` (optional date: `as of YYYY-MM-DD`).")
 
 # File upload section
 with st.expander("📎 Attach Files (Images, PDFs, PPT, Docs)", expanded=bool(st.session_state.uploaded_files)):
@@ -936,18 +937,26 @@ if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RA
 
     # Dedicated ICT investigation routing (JSON response mode)
     ict_entity = extract_ict_entity(prompt)
+    ict_as_of = extract_ict_date(prompt)
     if ict_entity:
-        route_payload = run_ict_investigation(ict_entity)
-        json_output = json.dumps(route_payload, indent=2)
-
         current_chat["messages"].append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.expander(f"ICT Investigation JSON ({ict_entity})", expanded=False):
+            with st.status("Running ICT investigation...", expanded=True) as status:
+                status.write("1) Parsing ticker and optional date from your prompt.")
+                status.write(f"2) Ticker: `{ict_entity}` | As of: `{ict_as_of or 'latest available'}`")
+                status.write("3) Fetching OHLC market data for weekly/daily/1h/30m/15m.")
+                status.write("4) Computing SMC/fallback features for each timeframe.")
+                route_payload = run_infy_route(as_of=ict_as_of) if ict_entity == "INFY" else run_mtf_ict_snapshot(ict_entity, as_of=ict_as_of, route_name="generic_ict_route")
+                status.write("5) Finalizing JSON payload and persisting conversation memory.")
+                status.update(label="ICT investigation complete", state="complete", expanded=False)
+
+            with st.expander("ICT Investigation JSON", expanded=False):
                 st.json(route_payload, expanded=False)
 
+        json_output = json.dumps(route_payload, indent=2)
         current_chat["messages"].append(
             {
                 "role": "assistant",
