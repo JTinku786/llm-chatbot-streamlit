@@ -918,17 +918,7 @@ for message in current_chat["messages"]:
                 else:
                     st.markdown(content_part)
         else:
-            if (
-                message["role"] == "assistant"
-                and isinstance(message["content"], dict)
-                and message["content"].get("type") == "ict_investigation"
-            ):
-                payload = message["content"].get("payload", {})
-                ticker = message["content"].get("ticker", "")
-                with st.expander(f"ICT Investigation JSON ({ticker})", expanded=False):
-                    st.json(payload, expanded=False)
-            else:
-                st.markdown(message["content"])
+            st.markdown(message["content"])
 
 # Chat input
 if prompt := st.chat_input("Ask anything... (weather/web tools + optional ICT RAG)"):
