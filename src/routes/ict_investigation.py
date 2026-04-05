@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import importlib
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-ET = ZoneInfo("US/Eastern")
+def _get_eastern_tz():
+    for _tz in ("America/New_York", "US/Eastern"):
+        try:
+            return ZoneInfo(_tz)
+        except ZoneInfoNotFoundError:
+            pass
+    return timezone.utc
+
+ET = _get_eastern_tz()
 
 SWING_LEN = 4
 SWING_LEN_OB = 10
@@ -22,13 +30,13 @@ ATR_WIN = 14
 BIG_BODY_ATR_MULT = 1.25
 HUGE_WICK_TO_BODY = 2.0
 CONSOLID_WIN = 10
-CONSOLIDATR_MULT = 0.75
+CONSOLIDATOR_MULT = 0.75
 FOLLOW_THROUGH_BARS = 3
 FAIL_FAST_BARS = 3
 NEAR_PCT = 0.004
 
 TIMEFRAMES = {
-    "weekly": {"interval": "1wk", "period": "5y"},
+    "weekly": {"interval": "1 week", "period": "5y"},
     "daily": {"interval": "1d", "period": "2y"},
     "1h": {"interval": "1h", "period": "90d"},
     "30m": {"interval": "30m", "period": "60d"},
